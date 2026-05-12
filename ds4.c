@@ -20,21 +20,37 @@
 #include <inttypes.h>
 #include <ctype.h>
 #include <math.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/file.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <time.h>
+#include <wchar.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <io.h>
+#include <process.h>
+#define fileno _fileno
+#define isatty _isatty
+#else
+#include <sys/file.h>
+#include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 #include "ds4.h"
+#include "src/platform/os_clock.h"
+#include "src/platform/os_mmap.h"
+#include "src/platform/os_path.h"
+#include "src/platform/os_thread.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -108,7 +124,11 @@ enum {
     DS4_N_HC_SINKHORN_ITER = 20,
 };
 
+#ifdef _WIN32
+static HANDLE g_ds4_lock_handle = INVALID_HANDLE_VALUE;
+#else
 static int g_ds4_lock_fd = -1;
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_MAYBE_UNUSED __attribute__((unused))
@@ -302,7 +322,7 @@ static const uint64_t iq2xxs_grid[256] = {
 
 static int8_t iq2xxs_signed_grid[256][128][8];
 static int8_t iq2xxs_signs[128][8];
-static pthread_once_t iq2xxs_signed_grid_once = PTHREAD_ONCE_INIT;
+static os_once_t iq2xxs_signed_grid_once = OS_ONCE_INIT;
 
 static void iq2xxs_signed_grid_init(void) {
     for (uint32_t s = 0; s < 128; s++) {
@@ -509,9 +529,18 @@ static void *xmalloc_zeroed(size_t n, size_t size) {
 }
 
 static double now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
+    return os_monotonic_sec();
+}
+
+static uint64_t ds4_page_size(void) {
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwPageSize ? (uint64_t)si.dwPageSize : 4096u;
+#else
+    const long ps = sysconf(_SC_PAGESIZE);
+    return ps > 0 ? (uint64_t)ps : 4096u;
+#endif
 }
 
 static const char *ds4_log_color_code(ds4_log_type type) {
@@ -555,7 +584,7 @@ void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...) {
 }
 
 static bool write_f32_binary_file(const char *path, const float *data, uint64_t n) {
-    FILE *fp = fopen(path, "wb");
+    FILE *fp = os_fopen(path, "wb");
     if (!fp) {
         fprintf(stderr, "ds4: failed to open %s for writing: %s\n", path, strerror(errno));
         return false;
@@ -570,21 +599,23 @@ static bool write_f32_binary_file(const char *path, const float *data, uint64_t 
 }
 
 static bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
-    struct stat st;
-    if (stat(path, &st) != 0) {
+    os_file_t f;
+    if (os_file_open_read(&f, path) != 0) {
         fprintf(stderr, "ds4: failed to stat %s: %s\n", path, strerror(errno));
         return false;
     }
-    if (st.st_size < 0 || (uint64_t)st.st_size != n * sizeof(float)) {
+    uint64_t file_size = os_file_size(&f);
+    os_file_close(&f);
+    if (file_size == UINT64_MAX || file_size != n * sizeof(float)) {
         fprintf(stderr,
                 "ds4: %s has size %llu bytes, expected %llu bytes\n",
                 path,
-                (unsigned long long)st.st_size,
+                (unsigned long long)file_size,
                 (unsigned long long)(n * sizeof(float)));
         return false;
     }
 
-    FILE *fp = fopen(path, "rb");
+    FILE *fp = os_fopen(path, "rb");
     if (!fp) {
         fprintf(stderr, "ds4: failed to open %s for reading: %s\n", path, strerror(errno));
         return false;
@@ -614,10 +645,10 @@ typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
 #define DS4_MAX_THREADS 32
 
 typedef struct {
-    pthread_t threads[DS4_MAX_THREADS];
-    pthread_mutex_t mutex;
-    pthread_cond_t work_cond;
-    pthread_cond_t done_cond;
+    os_thread_t threads[DS4_MAX_THREADS];
+    os_mutex_t mutex;
+    os_cond_t work_cond;
+    os_cond_t done_cond;
     uint32_t n_threads;
     uint32_t n_workers;
     uint32_t generation;
@@ -630,7 +661,7 @@ typedef struct {
 } ds4_thread_pool;
 
 static ds4_thread_pool g_pool;
-static __thread int g_parallel_depth;
+static _Thread_local int g_parallel_depth;
 static uint32_t g_requested_threads;
 
 static void *ds4_worker_main(void *arg) {
@@ -638,12 +669,12 @@ static void *ds4_worker_main(void *arg) {
     uint32_t seen_generation = 0;
 
     for (;;) {
-        pthread_mutex_lock(&g_pool.mutex);
+        os_mutex_lock(&g_pool.mutex);
         while (seen_generation == g_pool.generation && !g_pool.shutdown) {
-            pthread_cond_wait(&g_pool.work_cond, &g_pool.mutex);
+            os_cond_wait(&g_pool.work_cond, &g_pool.mutex);
         }
         if (g_pool.shutdown) {
-            pthread_mutex_unlock(&g_pool.mutex);
+            os_mutex_unlock(&g_pool.mutex);
             return NULL;
         }
 
@@ -652,7 +683,7 @@ static void *ds4_worker_main(void *arg) {
         void *ctx = g_pool.ctx;
         const uint64_t n_rows = g_pool.n_rows;
         const uint32_t n_threads = g_pool.n_threads;
-        pthread_mutex_unlock(&g_pool.mutex);
+        os_mutex_unlock(&g_pool.mutex);
 
         const uint64_t rows_per_thread = (n_rows + n_threads - 1) / n_threads;
         const uint64_t row0 = (uint64_t)tid * rows_per_thread;
@@ -664,12 +695,12 @@ static void *ds4_worker_main(void *arg) {
             g_parallel_depth--;
         }
 
-        pthread_mutex_lock(&g_pool.mutex);
+        os_mutex_lock(&g_pool.mutex);
         g_pool.done++;
         if (g_pool.done == g_pool.n_workers) {
-            pthread_cond_signal(&g_pool.done_cond);
+            os_cond_signal(&g_pool.done_cond);
         }
-        pthread_mutex_unlock(&g_pool.mutex);
+        os_mutex_unlock(&g_pool.mutex);
     }
 }
 
@@ -678,10 +709,10 @@ static void *ds4_worker_main(void *arg) {
 static void ds4_threads_init(void) {
     if (g_pool.initialized) return;
 
-    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    os_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
 
     uint32_t n_threads = 12;
-    const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    const long online_cpus = os_cpu_count();
     if (online_cpus > 0) {
         n_threads = online_cpus < 12 ? (uint32_t)online_cpus : 12;
     }
@@ -695,9 +726,9 @@ static void ds4_threads_init(void) {
     if (n_threads > DS4_MAX_THREADS) n_threads = DS4_MAX_THREADS;
     if (n_threads == 0) n_threads = 1;
 
-    pthread_mutex_init(&g_pool.mutex, NULL);
-    pthread_cond_init(&g_pool.work_cond, NULL);
-    pthread_cond_init(&g_pool.done_cond, NULL);
+    os_mutex_init(&g_pool.mutex);
+    os_cond_init(&g_pool.work_cond);
+    os_cond_init(&g_pool.done_cond);
     g_pool.n_threads = n_threads;
     g_pool.n_workers = n_threads > 0 ? n_threads - 1 : 0;
     g_pool.generation = 0;
@@ -706,7 +737,7 @@ static void ds4_threads_init(void) {
     g_pool.initialized = true;
 
     for (uint32_t i = 1; i < n_threads; i++) {
-        if (pthread_create(&g_pool.threads[i], NULL, ds4_worker_main, (void *)(uintptr_t)i) != 0) {
+        if (os_thread_create(&g_pool.threads[i], ds4_worker_main, (void *)(uintptr_t)i) != 0) {
             ds4_die("failed to create worker thread");
         }
     }
@@ -715,19 +746,19 @@ static void ds4_threads_init(void) {
 static void ds4_threads_shutdown(void) {
     if (!g_pool.initialized) return;
 
-    pthread_mutex_lock(&g_pool.mutex);
+    os_mutex_lock(&g_pool.mutex);
     g_pool.shutdown = true;
     g_pool.generation++;
-    pthread_cond_broadcast(&g_pool.work_cond);
-    pthread_mutex_unlock(&g_pool.mutex);
+    os_cond_broadcast(&g_pool.work_cond);
+    os_mutex_unlock(&g_pool.mutex);
 
     for (uint32_t i = 1; i < g_pool.n_threads; i++) {
-        pthread_join(g_pool.threads[i], NULL);
+        os_thread_join(g_pool.threads[i]);
     }
 
-    pthread_cond_destroy(&g_pool.done_cond);
-    pthread_cond_destroy(&g_pool.work_cond);
-    pthread_mutex_destroy(&g_pool.mutex);
+    os_cond_destroy(&g_pool.done_cond);
+    os_cond_destroy(&g_pool.work_cond);
+    os_mutex_destroy(&g_pool.mutex);
     memset(&g_pool, 0, sizeof(g_pool));
 }
 
@@ -741,18 +772,18 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
         return;
     }
 
-    pthread_mutex_lock(&g_pool.mutex);
+    os_mutex_lock(&g_pool.mutex);
     g_pool.fn = fn;
     g_pool.ctx = ctx;
     g_pool.n_rows = n_rows;
     g_pool.done = 0;
     g_pool.generation++;
-    pthread_cond_broadcast(&g_pool.work_cond);
+    os_cond_broadcast(&g_pool.work_cond);
 
     const uint64_t rows_per_thread = (n_rows + g_pool.n_threads - 1) / g_pool.n_threads;
     uint64_t main_row1 = rows_per_thread;
     if (main_row1 > n_rows) main_row1 = n_rows;
-    pthread_mutex_unlock(&g_pool.mutex);
+    os_mutex_unlock(&g_pool.mutex);
 
     if (main_row1 > 0) {
         g_parallel_depth++;
@@ -760,11 +791,11 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
         g_parallel_depth--;
     }
 
-    pthread_mutex_lock(&g_pool.mutex);
+    os_mutex_lock(&g_pool.mutex);
     while (g_pool.done < g_pool.n_workers) {
-        pthread_cond_wait(&g_pool.done_cond, &g_pool.mutex);
+        os_cond_wait(&g_pool.done_cond, &g_pool.mutex);
     }
-    pthread_mutex_unlock(&g_pool.mutex);
+    os_mutex_unlock(&g_pool.mutex);
 }
 
 static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
@@ -913,7 +944,7 @@ typedef struct {
 } ds4_tensor;
 
 typedef struct {
-    int fd;
+    os_mmap_t mmap;
     const uint8_t *map;
     uint64_t size;
 
@@ -1078,10 +1109,8 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
-    if (m->map) munmap((void *)m->map, (size_t)m->size);
-    if (m->fd >= 0) close(m->fd);
+    os_mmap_close(&m->mmap);
     memset(m, 0, sizeof(*m));
-    m->fd = -1;
 }
 
 static void model_prefetch_cpu_mapping(const ds4_model *m) {
@@ -1095,17 +1124,7 @@ static void model_prefetch_cpu_mapping(const ds4_model *m) {
      * pin the GGUF; it just asks the kernel to start bringing the read-only
      * mapping into the page cache before token generation reaches it.
      */
-#if defined(POSIX_MADV_WILLNEED)
-    const int rc = posix_madvise((void *)m->map, (size_t)m->size, POSIX_MADV_WILLNEED);
-    if (rc != 0) {
-        ds4_log(stderr,
-                DS4_LOG_WARNING,
-                "ds4: warning: POSIX_MADV_WILLNEED failed for CPU model mapping: %s\n",
-                strerror(rc));
-    }
-#else
-    (void)m;
-#endif
+    os_mmap_warm(&m->mmap);
 }
 
 /* Read the GGUF metadata table.  Values stay in the mmap; we store offsets so
@@ -1196,14 +1215,14 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
 static void model_open(ds4_model *m, const char *path, bool metal_mapping,
                        bool prefetch_cpu) {
     memset(m, 0, sizeof(*m));
-    m->fd = -1;
 
-    int fd = open(path, O_RDONLY);
-    if (fd == -1) ds4_die_errno("cannot open model", path);
-
-    struct stat st;
-    if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat model", path);
-    if (st.st_size < 32) ds4_die("model file is too small to be GGUF");
+    if (os_mmap_open_read(path, metal_mapping ? 1 : 0, &m->mmap) != 0) {
+        ds4_die_errno("cannot mmap model", path);
+    }
+    if (m->mmap.size < 32) {
+        os_mmap_close(&m->mmap);
+        ds4_die("model file is too small to be GGUF");
+    }
 
     /*
      * Metal wraps slices of this mapping as no-copy MTLBuffers, so the Metal
@@ -1217,13 +1236,8 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
      * normal user-space failure. Keeping CPU inference off the shared mapping
      * avoids that VM accounting path while preserving normal file-backed reads.
      */
-    const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
-    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
-    if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
-
-    m->fd = fd;
-    m->map = map;
-    m->size = (uint64_t)st.st_size;
+    m->map = m->mmap.addr;
+    m->size = m->mmap.size;
 
     ds4_cursor c = cursor_at(m, 0);
     uint32_t magic;
@@ -1479,7 +1493,7 @@ static void model_warm_weights(const ds4_model *m) {
     const uint64_t end = m->size;
     if (start >= end) return;
 
-    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    const uint64_t page = ds4_page_size();
     const uint8_t *p = m->map;
     volatile uint64_t checksum = 0;
     const double t0 = now_sec();
@@ -8518,7 +8532,7 @@ static void metal_graph_debug_dump_i32_tensor(
     if (ds4_gpu_tensor_read(t, 0, buf, n_i32 * sizeof(buf[0])) != 0) {
         char path[1024];
         snprintf(path, sizeof(path), "%s_%s-%u_pos%u.i32", prefix, name, il, pos);
-        FILE *fp = fopen(path, "wb");
+        FILE *fp = os_fopen(path, "wb");
         if (fp) {
             if (fwrite(buf, sizeof(buf[0]), (size_t)n_i32, fp) == (size_t)n_i32) {
                 fprintf(stderr, "ds4: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
@@ -15449,16 +15463,73 @@ ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
 }
 
 static void ds4_release_instance_lock(void) {
+#ifdef _WIN32
+    if (g_ds4_lock_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_ds4_lock_handle);
+        g_ds4_lock_handle = INVALID_HANDLE_VALUE;
+    }
+#else
     if (g_ds4_lock_fd >= 0) {
         close(g_ds4_lock_fd);
         g_ds4_lock_fd = -1;
     }
+#endif
 }
 
 /* Refuse to start a second ds4 process.  The model can map tens of GiB, so a
  * stale accidental second run is more dangerous than a normal CLI error. */
 static void ds4_acquire_instance_lock(void) {
     const char *path = getenv("DS4_LOCK_FILE");
+#ifdef _WIN32
+    wchar_t wpath[OS_MAX_PATH_W];
+    char default_path[OS_MAX_PATH_W * 4];
+    if (!path || !path[0]) {
+        wchar_t tmp[OS_MAX_PATH_W];
+        DWORD n = GetTempPathW(OS_MAX_PATH_W, tmp);
+        if (n > 0 && n + 9 < OS_MAX_PATH_W) {
+            wcscat(tmp, L"ds4.lock");
+            if (os_wide_to_utf8(tmp, default_path, sizeof(default_path)) > 0) {
+                path = default_path;
+            } else {
+                path = "ds4.lock";
+            }
+        } else {
+            path = "ds4.lock";
+        }
+    }
+    if (os_utf8_to_wide(path, wpath, OS_MAX_PATH_W) <= 0) {
+        fprintf(stderr, "ds4: failed to decode lock file path %s as UTF-8\n", path);
+        exit(2);
+    }
+    HANDLE h = CreateFileW(wpath,
+                           GENERIC_READ | GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL,
+                           OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL,
+                           NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "ds4: failed to open lock file %s\n", path);
+        exit(2);
+    }
+
+    OVERLAPPED ol;
+    memset(&ol, 0, sizeof(ol));
+    if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0, MAXDWORD, MAXDWORD, &ol)) {
+        fprintf(stderr, "ds4: another ds4 process is already running; refusing to start\n");
+        CloseHandle(h);
+        exit(2);
+    }
+    SetFilePointer(h, 0, NULL, FILE_BEGIN);
+    SetEndOfFile(h);
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "%lu\n", (unsigned long)GetCurrentProcessId());
+    DWORD written = 0;
+    (void)WriteFile(h, buf, (DWORD)n, &written, NULL);
+    g_ds4_lock_handle = h;
+    atexit(ds4_release_instance_lock);
+#else
     if (!path || !path[0]) path = "/tmp/ds4.lock";
 
     const int fd = open(path, O_RDWR | O_CREAT, 0600);
@@ -15499,6 +15570,7 @@ static void ds4_acquire_instance_lock(void) {
     dprintf(fd, "%ld\n", (long)getpid());
     g_ds4_lock_fd = fd;
     atexit(ds4_release_instance_lock);
+#endif
 }
 
 struct ds4_session {
@@ -16468,12 +16540,25 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
         snap->cap = bytes;
     }
 
-    FILE *fp = fmemopen(snap->ptr, (size_t)bytes, "wb");
+    FILE *fp = NULL;
+#ifdef _WIN32
+    fp = tmpfile();
+#else
+    fp = fmemopen(snap->ptr, (size_t)bytes, "wb");
+#endif
     if (!fp) {
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot");
         return 1;
     }
     const int rc = ds4_session_save_payload(s, fp, err, errlen);
+#ifdef _WIN32
+    if (rc == 0 && (fflush(fp) != 0 || fseek(fp, 0, SEEK_SET) != 0 ||
+                    fread(snap->ptr, 1, (size_t)bytes, fp) != (size_t)bytes)) {
+        fclose(fp);
+        payload_set_err(err, errlen, "failed to copy memory session snapshot");
+        return 1;
+    }
+#endif
     if (fclose(fp) != 0 && rc == 0) {
         payload_set_err(err, errlen, "failed to finalize memory session snapshot");
         return 1;
@@ -16493,11 +16578,25 @@ int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, 
         return 1;
     }
 
-    FILE *fp = fmemopen((void *)snap->ptr, (size_t)snap->len, "rb");
+    FILE *fp = NULL;
+#ifdef _WIN32
+    fp = tmpfile();
+#else
+    fp = fmemopen((void *)snap->ptr, (size_t)snap->len, "rb");
+#endif
     if (!fp) {
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot restore");
         return 1;
     }
+#ifdef _WIN32
+    if (fwrite(snap->ptr, 1, (size_t)snap->len, fp) != (size_t)snap->len ||
+        fflush(fp) != 0 ||
+        fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        payload_set_err(err, errlen, "failed to stage memory session snapshot restore");
+        return 1;
+    }
+#endif
     const int rc = ds4_session_load_payload(s, fp, snap->len, err, errlen);
     if (fclose(fp) != 0 && rc == 0) {
         payload_set_err(err, errlen, "failed to close memory session snapshot");
@@ -16952,8 +17051,8 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
-    e->model.fd = -1;
-    e->mtp_model.fd = -1;
+    os_mmap_init(&e->model.mmap);
+    os_mmap_init(&e->mtp_model.mmap);
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
@@ -17022,7 +17121,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         ds4_gpu_set_quality(e->quality);
-        (void)ds4_gpu_set_model_fd(e->model.fd);
+        (void)ds4_gpu_set_model_file(&e->model.mmap.file);
         if (!ds4_gpu_set_model_map_range(e->model.map,
                                            e->model.size,
                                            e->model.tensor_data_pos,

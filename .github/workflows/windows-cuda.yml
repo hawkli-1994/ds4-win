@@ -1,0 +1,96 @@
+name: Windows CUDA
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+      - codex/windows-cuda
+  workflow_dispatch:
+    inputs:
+      cuda_arch:
+        description: "CUDA architecture to build, e.g. 89 for Ada or native on a GPU runner"
+        required: false
+        default: "89"
+
+permissions:
+  contents: read
+
+env:
+  CUDA_VERSION: "12.6.3"
+  DS4_CUDA_ARCHITECTURES: ${{ github.event.inputs.cuda_arch || '89' }}
+
+jobs:
+  build-windows-cuda:
+    name: Build ds4_server.exe
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvcc", "visual_studio_integration", "cudart", "cublas", "cublas_dev"]'
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          cmake --version
+          nvcc --version
+          Write-Host "CUDA_PATH=$env:CUDA_PATH"
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DDS4_CUDA_ARCHITECTURES="${env:DS4_CUDA_ARCHITECTURES}"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/Release/ds4_server.exe dist/
+
+          $cudaBin = Join-Path $env:CUDA_PATH "bin"
+          foreach ($pattern in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {
+            Get-ChildItem $cudaBin -Filter $pattern -File -ErrorAction SilentlyContinue |
+              Copy-Item -Destination dist -Force
+          }
+
+          @"
+          ds4_server.exe Windows CUDA build
+
+          Built from: $env:GITHUB_SHA
+          CUDA toolkit: $env:CUDA_VERSION
+          CUDA architectures: $env:DS4_CUDA_ARCHITECTURES
+
+          Run:
+            ds4_server.exe --model C:\path\to\ds4flash.gguf --cuda --host 127.0.0.1 --port 8000
+
+          Notes:
+            - A recent NVIDIA driver is required on the target machine.
+            - Visual C++ Redistributable may be required if it is not already installed.
+          "@ | Set-Content -Encoding UTF8 dist/README.txt
+
+          Compress-Archive -Path dist/* -DestinationPath ds4_server-windows-cuda.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ds4_server-windows-cuda-${{ github.sha }}
+          path: ds4_server-windows-cuda.zip
+          if-no-files-found: error
