@@ -204,6 +204,34 @@ static bool server_file_size(const char *path, uint64_t *size_out) {
     return true;
 }
 
+static int server_fseek(FILE *fp, int64_t off, int whence) {
+#ifdef _WIN32
+    return _fseeki64(fp, off, whence);
+#else
+    return fseeko(fp, (off_t)off, whence);
+#endif
+}
+
+static int server_ftruncate_fp(FILE *fp, uint64_t size) {
+#ifdef _WIN32
+    int fd = _fileno(fp);
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    errno_t rc = _chsize_s(fd, size);
+    if (rc != 0) {
+        errno = rc;
+        return -1;
+    }
+    return 0;
+#else
+    int fd = fileno(fp);
+    if (fd < 0) return -1;
+    return ftruncate(fd, (off_t)size);
+#endif
+}
+
 static int server_rename_replace(const char *tmp, const char *path) {
 #ifdef _WIN32
     wchar_t wtmp[OS_MAX_PATH_W];
@@ -5830,7 +5858,7 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
         uint64_t skip = (uint64_t)text_bytes + hdr.payload_bytes;
         if (ok && (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
             skip <= (uint64_t)INT64_MAX &&
-            fseeko(fp, (off_t)skip, SEEK_CUR) == 0)
+            server_fseek(fp, (int64_t)skip, SEEK_CUR) == 0)
         {
             kv_tool_map_load_from_pos(s, fp, &wanted);
         }
@@ -6040,7 +6068,7 @@ static bool kv_cache_existing_compatible(kv_disk_cache *kc, const char *path,
                                          const char sha[41],
                                          const char *text, size_t text_len,
                                          int quant_bits, int ctx_size) {
-    if (access(path, F_OK) != 0) return false;
+    if (!server_file_size(path, NULL)) return false;
     kv_entry e = {0};
     if (!kv_read_entry_file(path, sha, &e)) return false;
     bool compatible = (!kc->reject_different_quant || e.quant_bits == (uint8_t)quant_bits) &&
@@ -6065,8 +6093,8 @@ static void kv_cache_rewrite_tool_map(server *s, const char *path, const char *t
     bool ok = kv_read_header(fp, &hdr, &text_bytes);
     uint64_t end = KV_CACHE_FIXED_HEADER + 4ull + (uint64_t)text_bytes + hdr.payload_bytes;
     if (ok && end <= (uint64_t)INT64_MAX &&
-        fseeko(fp, (off_t)end, SEEK_SET) == 0 &&
-        ftruncate(fileno(fp), (off_t)end) == 0)
+        server_fseek(fp, (int64_t)end, SEEK_SET) == 0 &&
+        server_ftruncate_fp(fp, end) == 0)
     {
         uint64_t ignored = 0;
         ok = kv_tool_map_write(s, fp, text, &ignored) && fflush(fp) == 0;
@@ -6077,7 +6105,7 @@ static void kv_cache_rewrite_tool_map(server *s, const char *path, const char *t
                            (uint8_t)(hdr.ext_flags | KV_EXT_TOOL_MAP),
                            hdr.tokens, hdr.hits, hdr.ctx_size,
                            hdr.created_at, now, hdr.payload_bytes);
-            ok = fseeko(fp, 0, SEEK_SET) == 0 &&
+            ok = server_fseek(fp, 0, SEEK_SET) == 0 &&
                  fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
                  fflush(fp) == 0;
         }
