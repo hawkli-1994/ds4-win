@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <time.h>
+#include <wchar.h>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -15480,9 +15481,22 @@ static void ds4_release_instance_lock(void) {
 static void ds4_acquire_instance_lock(void) {
     const char *path = getenv("DS4_LOCK_FILE");
 #ifdef _WIN32
-    if (!path || !path[0]) path = "ds4.lock";
-
     wchar_t wpath[OS_MAX_PATH_W];
+    char default_path[OS_MAX_PATH_W * 4];
+    if (!path || !path[0]) {
+        wchar_t tmp[OS_MAX_PATH_W];
+        DWORD n = GetTempPathW(OS_MAX_PATH_W, tmp);
+        if (n > 0 && n + 9 < OS_MAX_PATH_W) {
+            wcscat(tmp, L"ds4.lock");
+            if (os_wide_to_utf8(tmp, default_path, sizeof(default_path)) > 0) {
+                path = default_path;
+            } else {
+                path = "ds4.lock";
+            }
+        } else {
+            path = "ds4.lock";
+        }
+    }
     if (os_utf8_to_wide(path, wpath, OS_MAX_PATH_W) <= 0) {
         fprintf(stderr, "ds4: failed to decode lock file path %s as UTF-8\n", path);
         exit(2);
@@ -16526,18 +16540,25 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
         snap->cap = bytes;
     }
 
-    FILE *fp = tmpfile();
+    FILE *fp = NULL;
+#ifdef _WIN32
+    fp = tmpfile();
+#else
+    fp = fmemopen(snap->ptr, (size_t)bytes, "wb");
+#endif
     if (!fp) {
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot");
         return 1;
     }
     const int rc = ds4_session_save_payload(s, fp, err, errlen);
+#ifdef _WIN32
     if (rc == 0 && (fflush(fp) != 0 || fseek(fp, 0, SEEK_SET) != 0 ||
                     fread(snap->ptr, 1, (size_t)bytes, fp) != (size_t)bytes)) {
         fclose(fp);
         payload_set_err(err, errlen, "failed to copy memory session snapshot");
         return 1;
     }
+#endif
     if (fclose(fp) != 0 && rc == 0) {
         payload_set_err(err, errlen, "failed to finalize memory session snapshot");
         return 1;
@@ -16557,11 +16578,17 @@ int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, 
         return 1;
     }
 
-    FILE *fp = tmpfile();
+    FILE *fp = NULL;
+#ifdef _WIN32
+    fp = tmpfile();
+#else
+    fp = fmemopen((void *)snap->ptr, (size_t)snap->len, "rb");
+#endif
     if (!fp) {
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot restore");
         return 1;
     }
+#ifdef _WIN32
     if (fwrite(snap->ptr, 1, (size_t)snap->len, fp) != (size_t)snap->len ||
         fflush(fp) != 0 ||
         fseek(fp, 0, SEEK_SET) != 0) {
@@ -16569,6 +16596,7 @@ int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, 
         payload_set_err(err, errlen, "failed to stage memory session snapshot restore");
         return 1;
     }
+#endif
     const int rc = ds4_session_load_payload(s, fp, snap->len, err, errlen);
     if (fclose(fp) != 0 && rc == 0) {
         payload_set_err(err, errlen, "failed to close memory session snapshot");

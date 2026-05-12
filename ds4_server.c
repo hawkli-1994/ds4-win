@@ -155,6 +155,30 @@ static void os_localtime(time_t t, struct tm *out) {
 #endif
 }
 
+#ifdef _WIN32
+static int win_error_to_errno(DWORD e) {
+    switch (e) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+        return ENOENT;
+    case ERROR_ACCESS_DENIED:
+        return EACCES;
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_LOCK_VIOLATION:
+        return EBUSY;
+    case ERROR_ALREADY_EXISTS:
+    case ERROR_FILE_EXISTS:
+        return EEXIST;
+    case ERROR_INVALID_HANDLE:
+        return EBADF;
+    case ERROR_INVALID_PARAMETER:
+        return EINVAL;
+    default:
+        return EIO;
+    }
+}
+#endif
+
 static int server_mkdir(const char *path) {
 #ifdef _WIN32
     wchar_t wpath[OS_MAX_PATH_W];
@@ -163,12 +187,7 @@ static int server_mkdir(const char *path) {
         return -1;
     }
     if (CreateDirectoryW(wpath, NULL)) return 0;
-    DWORD err = GetLastError();
-    if (err == ERROR_ALREADY_EXISTS) {
-        errno = EEXIST;
-        return -1;
-    }
-    errno = EINVAL;
+    errno = win_error_to_errno(GetLastError());
     return -1;
 #else
     return mkdir(path, 0700);
@@ -195,7 +214,7 @@ static int server_rename_replace(const char *tmp, const char *path) {
         return -1;
     }
     if (MoveFileExW(wtmp, wpath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
-    errno = EINVAL;
+    errno = win_error_to_errno(GetLastError());
     return -1;
 #else
     return rename(tmp, path);
@@ -210,7 +229,7 @@ static int server_unlink(const char *path) {
         return -1;
     }
     if (DeleteFileW(wpath)) return 0;
-    errno = EINVAL;
+    errno = win_error_to_errno(GetLastError());
     return -1;
 #else
     return unlink(path);
@@ -226,7 +245,7 @@ static int server_rmdir(const char *path) {
         return -1;
     }
     if (RemoveDirectoryW(wpath)) return 0;
-    errno = EINVAL;
+    errno = win_error_to_errno(GetLastError());
     return -1;
 #else
     return rmdir(path);
@@ -7907,7 +7926,11 @@ static socket_t listen_on(const char *host, int port) {
     socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == OS_INVALID_SOCKET) return OS_INVALID_SOCKET;
     int yes = 1;
+#ifdef _WIN32
+    setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&yes, sizeof(yes));
+#else
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+#endif
 
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));

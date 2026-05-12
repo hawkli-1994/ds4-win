@@ -14,6 +14,36 @@
 #include <sys/stat.h>
 #endif
 
+#ifdef _WIN32
+static int os_win_error_to_errno(DWORD e) {
+    switch (e) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+        return ENOENT;
+    case ERROR_ACCESS_DENIED:
+        return EACCES;
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_LOCK_VIOLATION:
+        return EBUSY;
+    case ERROR_ALREADY_EXISTS:
+    case ERROR_FILE_EXISTS:
+        return EEXIST;
+    case ERROR_HANDLE_EOF:
+        return 0;
+    case ERROR_INVALID_HANDLE:
+        return EBADF;
+    case ERROR_INVALID_PARAMETER:
+    case ERROR_INVALID_FUNCTION:
+        return EINVAL;
+    case ERROR_NOT_ENOUGH_MEMORY:
+    case ERROR_OUTOFMEMORY:
+        return ENOMEM;
+    default:
+        return EIO;
+    }
+}
+#endif
+
 void os_file_init(os_file_t *f) {
     if (!f) return;
 #ifdef _WIN32
@@ -53,13 +83,39 @@ int os_file_open_read(os_file_t *f, const char *path_utf8) {
                                FILE_FLAG_RANDOM_ACCESS |
                                FILE_FLAG_OVERLAPPED,
                            NULL);
-    if (h == INVALID_HANDLE_VALUE) return -1;
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = os_win_error_to_errno(GetLastError());
+        return -1;
+    }
     f->h = h;
     return 0;
 #else
     int fd = open(path_utf8, O_RDONLY);
     if (fd < 0) return -1;
     f->fd = fd;
+    return 0;
+#endif
+}
+
+int os_file_dup(os_file_t *dst, const os_file_t *src) {
+    if (!dst || !os_file_valid(src)) {
+        errno = EINVAL;
+        return -1;
+    }
+    os_file_init(dst);
+#ifdef _WIN32
+    HANDLE h = INVALID_HANDLE_VALUE;
+    HANDLE self = GetCurrentProcess();
+    if (!DuplicateHandle(self, src->h, self, &h, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        errno = os_win_error_to_errno(GetLastError());
+        return -1;
+    }
+    dst->h = h;
+    return 0;
+#else
+    int fd = dup(src->fd);
+    if (fd < 0) return -1;
+    dst->fd = fd;
     return 0;
 #endif
 }
@@ -77,7 +133,9 @@ FILE *os_fopen(const char *path_utf8, const char *mode) {
         errno = EINVAL;
         return NULL;
     }
-    return _wfopen(wpath, wmode);
+    FILE *fp = _wfopen(wpath, wmode);
+    if (!fp) errno = os_win_error_to_errno(GetLastError());
+    return fp;
 #else
     return fopen(path_utf8, mode);
 #endif
@@ -101,7 +159,10 @@ uint64_t os_file_size(const os_file_t *f) {
     }
 #ifdef _WIN32
     LARGE_INTEGER sz;
-    if (!GetFileSizeEx(f->h, &sz) || sz.QuadPart < 0) return UINT64_MAX;
+    if (!GetFileSizeEx(f->h, &sz) || sz.QuadPart < 0) {
+        errno = os_win_error_to_errno(GetLastError());
+        return UINT64_MAX;
+    }
     return (uint64_t)sz.QuadPart;
 #else
     struct stat st;
@@ -118,7 +179,10 @@ int64_t os_pread(const os_file_t *f, void *buf, uint64_t len, uint64_t off) {
     uint64_t done = 0;
 #ifdef _WIN32
     HANDLE ev = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!ev) return -(int64_t)GetLastError();
+    if (!ev) {
+        errno = os_win_error_to_errno(GetLastError());
+        return -1;
+    }
     while (done < len) {
         const uint64_t remaining = len - done;
         DWORD chunk = (DWORD)(remaining > 0x40000000ull ? 0x40000000ul : remaining);
@@ -141,13 +205,15 @@ int64_t os_pread(const os_file_t *f, void *buf, uint64_t len, uint64_t off) {
             if (!ok) {
                 CloseHandle(ev);
                 if (err == ERROR_HANDLE_EOF) return (int64_t)done;
-                return -(int64_t)err;
+                errno = os_win_error_to_errno(err);
+                return -1;
             }
         } else if (!GetOverlappedResult(f->h, &ol, &got, FALSE)) {
             DWORD err = GetLastError();
             CloseHandle(ev);
             if (err == ERROR_HANDLE_EOF) return (int64_t)done;
-            return -(int64_t)err;
+            errno = os_win_error_to_errno(err);
+            return -1;
         }
         if (got == 0) break;
         done += got;

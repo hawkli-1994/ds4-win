@@ -23,6 +23,7 @@ typedef struct {
 
 void os_file_init(os_file_t *f);
 int os_file_open_read(os_file_t *f, const char *path_utf8);
+int os_file_dup(os_file_t *dst, const os_file_t *src);
 void os_file_close(os_file_t *f);
 int os_file_valid(const os_file_t *f);
 uint64_t os_file_size(const os_file_t *f);

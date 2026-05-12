@@ -56,6 +56,13 @@ if(WIN32)
     target_link_libraries(ds4_server PRIVATE ws2_32 bcrypt)
 endif()
 
+if(MSVC)
+    target_compile_options(ds4_platform PRIVATE /W3)
+    target_compile_options(ds4 PRIVATE /W3)
+    target_compile_options(ds4_server PRIVATE /W3)
+    target_compile_options(ds4_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W3>)
+endif()
+
 if(NOT WIN32)
     add_executable(ds4_cli ds4_cli.c linenoise.c)
     target_link_libraries(ds4_cli PRIVATE

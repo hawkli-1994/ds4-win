@@ -830,6 +830,23 @@ static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
 #endif
 }
 
+static void cuda_model_file_clear(void) {
+    if (g_model_file_valid) {
+        os_file_close(&g_model_file);
+        g_model_file_valid = 0;
+    } else {
+        os_file_init(&g_model_file);
+    }
+    if (g_model_direct_fd >= 0) {
+#if defined(__linux__)
+        (void)close(g_model_direct_fd);
+#endif
+        g_model_direct_fd = -1;
+    }
+    g_model_direct_align = 1;
+    g_model_file_size = 0;
+}
+
 static uint64_t cuda_round_down(uint64_t v, uint64_t align) {
     if (align <= 1) return v;
     return (v / align) * align;
@@ -1283,16 +1300,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_device_owned = 0;
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
-    os_file_init(&g_model_file);
-    g_model_file_valid = 0;
-    if (g_model_direct_fd >= 0) {
-#if defined(__linux__)
-        (void)close(g_model_direct_fd);
-#endif
-        g_model_direct_fd = -1;
-    }
-    g_model_direct_align = 1;
-    g_model_file_size = 0;
+    cuda_model_file_clear();
     g_model_cache_full = 0;
     if (g_model_prefetch_stream) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
@@ -1461,17 +1469,13 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
 }
 
 extern "C" int ds4_gpu_set_model_file(const os_file_t *file) {
-    os_file_init(&g_model_file);
-    g_model_file_valid = file && os_file_valid(file);
-    if (g_model_file_valid) g_model_file = *file;
-    g_model_file_size = 0;
-    if (g_model_direct_fd >= 0) {
-#if defined(__linux__)
-        (void)close(g_model_direct_fd);
-#endif
-        g_model_direct_fd = -1;
+    cuda_model_file_clear();
+    if (!file || !os_file_valid(file)) return 1;
+    if (os_file_dup(&g_model_file, file) != 0) {
+        fprintf(stderr, "ds4: CUDA model file duplicate failed: %s\n", strerror(errno));
+        return 0;
     }
-    g_model_direct_align = 1;
+    g_model_file_valid = 1;
     if (g_model_file_valid) {
         const uint64_t file_size = os_file_size(&g_model_file);
         if (file_size != UINT64_MAX) g_model_file_size = file_size;
