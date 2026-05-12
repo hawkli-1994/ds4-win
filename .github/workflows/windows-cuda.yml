@@ -38,7 +38,7 @@ jobs:
         with:
           cuda: ${{ env.CUDA_VERSION }}
           method: network
-          sub-packages: '["nvcc", "visual_studio_integration", "cudart", "cudart_dev", "cublas", "cublas_dev"]'
+          sub-packages: '["nvcc", "visual_studio_integration", "cudart", "cublas", "cublas_dev"]'
 
       - name: Show toolchain
         shell: pwsh
