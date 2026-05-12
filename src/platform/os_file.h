@@ -21,6 +21,10 @@ typedef struct {
 #endif
 } os_file_t;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void os_file_init(os_file_t *f);
 int os_file_open_read(os_file_t *f, const char *path_utf8);
 int os_file_dup(os_file_t *dst, const os_file_t *src);
@@ -29,5 +33,9 @@ int os_file_valid(const os_file_t *f);
 uint64_t os_file_size(const os_file_t *f);
 int64_t os_pread(const os_file_t *f, void *buf, uint64_t len, uint64_t off);
 FILE *os_fopen(const char *path_utf8, const char *mode);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

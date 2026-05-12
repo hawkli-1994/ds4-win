@@ -35,7 +35,7 @@ add_library(ds4_cuda STATIC ds4_cuda.cu)
 target_compile_features(ds4_cuda PRIVATE cxx_std_17)
 target_link_libraries(ds4_cuda PUBLIC ds4_platform)
 set_target_properties(ds4_cuda PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_SEPARABLE_COMPILATION OFF
     CUDA_ARCHITECTURES "${DS4_CUDA_ARCHITECTURES}"
 )
 
