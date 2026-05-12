@@ -7,22 +7,36 @@
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <time.h>
-#include <unistd.h>
 #include <unordered_map>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+#include "src/platform/os_clock.h"
+#include "src/platform/os_file.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
 #define CUDA_QK_K 256
+#if defined(__GNUC__) || defined(__clang__)
 #define DS4_CUDA_UNUSED __attribute__((unused))
+#else
+#define DS4_CUDA_UNUSED
+#endif
 
 enum {
     /* attention_decode_mixed_kernel stores raw-window scores plus visible
@@ -67,7 +81,8 @@ static int g_model_registered;
 static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
 static int g_model_hmm_direct;
-static int g_model_fd = -1;
+static os_file_t g_model_file;
+static int g_model_file_valid;
 static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
@@ -156,6 +171,17 @@ __global__ static void dequant_q8_0_to_f32_kernel(
         uint64_t out_dim,
         uint64_t blocks);
 
+static uint64_t cuda_page_size(void) {
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwPageSize ? (uint64_t)si.dwPageSize : 4096u;
+#else
+    const long ps = sysconf(_SC_PAGESIZE);
+    return ps > 0 ? (uint64_t)ps : 4096u;
+#endif
+}
+
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
@@ -223,8 +249,10 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 
     cudaError_t err = cudaSuccess;
     if (g_model_range_mapping_supported) {
-        const long page_sz_l = sysconf(_SC_PAGESIZE);
-        const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
+#ifdef _WIN32
+        g_model_range_mapping_supported = 0;
+#else
+        const uint64_t page_sz = cuda_page_size();
         const uintptr_t host_addr = (uintptr_t)((const char *)model_map + offset);
         const uintptr_t reg_addr = host_addr & ~(uintptr_t)(page_sz - 1u);
         const uint64_t reg_delta = (uint64_t)(host_addr - reg_addr);
@@ -254,6 +282,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) g_model_range_mapping_supported = 0;
             (void)cudaGetLastError();
         }
+#endif
     }
 
     void *dev = NULL;
@@ -623,9 +652,7 @@ static int cuda_ok(cudaError_t err, const char *what) {
 }
 
 static double cuda_wall_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
+    return os_monotonic_sec();
 }
 
 static int cuda_model_load_progress_enabled(void) {
@@ -680,6 +707,9 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
 
 static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || map_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
+#ifdef _WIN32
+    return 0;
+#else
     if (getenv("DS4_CUDA_NO_MODEL_PREFETCH") != NULL ||
         getenv("DS4_CUDA_COPY_MODEL") != NULL ||
         getenv("DS4_CUDA_WEIGHT_CACHE") != NULL ||
@@ -704,8 +734,7 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
     loc.type = cudaMemLocationTypeDevice;
     loc.id = device;
 
-    const long page_sz_l = sysconf(_SC_PAGESIZE);
-    const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
+    const uint64_t page_sz = cuda_page_size();
     const uintptr_t host_addr = (uintptr_t)((const char *)model_map + map_offset);
     const uintptr_t pre_addr = host_addr & ~(uintptr_t)(page_sz - 1u);
     const uint64_t pre_delta = (uint64_t)(host_addr - pre_addr);
@@ -756,11 +785,13 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
             t1 - t0);
     g_model_hmm_direct = 1;
     return 1;
+#endif
 }
 
 static uint64_t cuda_model_copy_chunk_bytes(void) {
     uint64_t mb = 64;
-    const char *env = getenv("DS4_CUDA_MODEL_COPY_CHUNK_MB");
+    const char *env = getenv("DS4_CUDA_COPY_CHUNK_MIB");
+    if (!env || !env[0]) env = getenv("DS4_CUDA_MODEL_COPY_CHUNK_MB");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long long v = strtoull(env, &end, 10);
@@ -775,8 +806,7 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
 #if defined(POSIX_MADV_DONTNEED)
     if (getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || !model_map || bytes == 0 || offset > model_size) return;
     if (bytes > model_size - offset) bytes = model_size - offset;
-    const long page_sz_l = sysconf(_SC_PAGESIZE);
-    const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
+    const uint64_t page_sz = cuda_page_size();
     const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
     const uintptr_t h1 = h0 + bytes;
     const uintptr_t p0 = h0 & ~(uintptr_t)(page_sz - 1u);
@@ -792,8 +822,8 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
 
 static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_FADV_DONTNEED)
-    if (g_model_fd < 0 || getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
-    (void)posix_fadvise(g_model_fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
+    if (!g_model_file_valid || getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
+    (void)posix_fadvise(g_model_file.fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
 #else
     (void)offset;
     (void)bytes;
@@ -859,19 +889,9 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
     return 1;
 }
 
-static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
-    uint64_t done = 0;
-    while (done < bytes) {
-        const size_t n_req = (bytes - done > (uint64_t)SSIZE_MAX) ? (size_t)SSIZE_MAX : (size_t)(bytes - done);
-        ssize_t n = pread(fd, (char *)buf + done, n_req, (off_t)(offset + done));
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return 0;
-        }
-        if (n == 0) return 0;
-        done += (uint64_t)n;
-    }
-    return 1;
+static int cuda_pread_full(const os_file_t *file, void *buf, uint64_t bytes, uint64_t offset) {
+    int64_t n = os_pread(file, buf, bytes, offset);
+    return n >= 0 && (uint64_t)n == bytes;
 }
 
 static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
@@ -888,7 +908,10 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
             read_size <= g_model_file_size - aligned_off) {
             const int saved_errno = errno;
             errno = 0;
-            if (cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off)) {
+            os_file_t direct_file;
+            os_file_init(&direct_file);
+            direct_file.fd = g_model_direct_fd;
+            if (cuda_pread_full(&direct_file, stage, read_size, aligned_off)) {
                 *payload = (const char *)stage + delta;
                 errno = saved_errno;
                 return 1;
@@ -908,7 +931,8 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
 #else
     (void)stage_bytes;
 #endif
-    return cuda_pread_full(g_model_fd, stage, bytes, offset);
+    if (!g_model_file_valid) return 0;
+    return cuda_pread_full(&g_model_file, stage, bytes, offset);
 }
 
 static uint64_t cuda_model_cache_limit_bytes(void) {
@@ -987,7 +1011,7 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what) {
-    if (g_model_fd < 0 || bytes == 0) return NULL;
+    if (!g_model_file_valid || bytes == 0) return NULL;
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
         if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
@@ -1259,9 +1283,12 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_device_owned = 0;
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
-    g_model_fd = -1;
+    os_file_init(&g_model_file);
+    g_model_file_valid = 0;
     if (g_model_direct_fd >= 0) {
+#if defined(__linux__)
         (void)close(g_model_direct_fd);
+#endif
         g_model_direct_fd = -1;
     }
     g_model_direct_align = 1;
@@ -1395,6 +1422,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         }
     }
 
+#ifndef _WIN32
     cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
                                        cudaHostRegisterMapped | cudaHostRegisterReadOnly);
     if (err == cudaSuccess) {
@@ -1413,39 +1441,51 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         fprintf(stderr, "ds4: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
     }
+#else
+    g_model_range_mapping_supported = 0;
+#endif
     return 1;
 }
 
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
+#ifdef _WIN32
+    if (!cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) return 0;
+#else
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
     }
+#endif
     return 1;
 }
 
-extern "C" int ds4_gpu_set_model_fd(int fd) {
-    g_model_fd = fd;
+extern "C" int ds4_gpu_set_model_file(const os_file_t *file) {
+    os_file_init(&g_model_file);
+    g_model_file_valid = file && os_file_valid(file);
+    if (g_model_file_valid) g_model_file = *file;
     g_model_file_size = 0;
     if (g_model_direct_fd >= 0) {
+#if defined(__linux__)
         (void)close(g_model_direct_fd);
+#endif
         g_model_direct_fd = -1;
     }
     g_model_direct_align = 1;
-    if (fd >= 0) {
-        struct stat st;
-        if (fstat(fd, &st) == 0 && st.st_size > 0) {
-            g_model_file_size = (uint64_t)st.st_size;
-            if (st.st_blksize > 1) g_model_direct_align = (uint64_t)st.st_blksize;
-        }
+    if (g_model_file_valid) {
+        const uint64_t file_size = os_file_size(&g_model_file);
+        if (file_size != UINT64_MAX) g_model_file_size = file_size;
 #if defined(__linux__) && defined(O_DIRECT)
         if (getenv("DS4_CUDA_NO_DIRECT_IO") == NULL) {
             char proc_path[64];
-            snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
+            snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", g_model_file.fd);
             int direct_fd = open(proc_path, O_RDONLY | O_DIRECT);
             if (direct_fd >= 0) {
                 g_model_direct_fd = direct_fd;
+                struct stat st;
+                if (fstat(g_model_file.fd, &st) == 0 && st.st_blksize > 1) {
+                    g_model_direct_align = (uint64_t)st.st_blksize;
+                }
                 if (g_model_direct_align < 512) g_model_direct_align = 512;
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
                     fprintf(stderr, "ds4: CUDA model direct I/O enabled (align=%llu)\n",

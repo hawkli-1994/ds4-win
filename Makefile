@@ -12,11 +12,12 @@ OBJCFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
+PLATFORM_OBJS = os_file.o os_mmap.o os_thread.o
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_metal.o $(PLATFORM_OBJS)
+CPU_CORE_OBJS = ds4_cpu.o $(PLATFORM_OBJS)
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -27,8 +28,8 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-CORE_OBJS = ds4.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_cuda.o $(PLATFORM_OBJS)
+CPU_CORE_OBJS = ds4_cpu.o $(PLATFORM_OBJS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
@@ -95,6 +96,15 @@ rax.o: rax.c rax.h rax_malloc.h
 
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
+
+os_file.o: src/platform/os_file.c src/platform/os_file.h src/platform/os_path.h
+	$(CC) $(CFLAGS) -c -o $@ src/platform/os_file.c
+
+os_mmap.o: src/platform/os_mmap.c src/platform/os_mmap.h src/platform/os_file.h
+	$(CC) $(CFLAGS) -c -o $@ src/platform/os_mmap.c
+
+os_thread.o: src/platform/os_thread.c src/platform/os_thread.h
+	$(CC) $(CFLAGS) -c -o $@ src/platform/os_thread.c
 
 ds4_cpu.o: ds4.c ds4.h ds4_gpu.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c

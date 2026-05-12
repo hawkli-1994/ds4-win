@@ -1,5 +1,11 @@
 #include "ds4.h"
 #include "rax.h"
+#include "src/platform/os_clock.h"
+#include "src/platform/os_console.h"
+#include "src/platform/os_file.h"
+#include "src/platform/os_path.h"
+#include "src/platform/os_random.h"
+#include "src/platform/os_thread.h"
 
 /* OpenAI/Anthropic compatible local server.
  *
@@ -10,46 +16,98 @@
  * batching decisions in one place instead of spreading graph mutations across
  * client threads. */
 
-#include <arpa/inet.h>
 #include <ctype.h>
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <pthread.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
-#include <unistd.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <direct.h>
+#include <io.h>
+#include <process.h>
+#include "src/win32/win_dirent.h"
+typedef SOCKET socket_t;
+#define OS_INVALID_SOCKET INVALID_SOCKET
+#define SHUT_RDWR SD_BOTH
+#define close_socket(s) closesocket(s)
+#define sock_errno() WSAGetLastError()
+#define sock_interrupted(e) ((e) == WSAEINTR)
+#define sock_would_block(e) ((e) == WSAEWOULDBLOCK)
+#define strcasecmp _stricmp
+#define strncasecmp _strnicmp
+typedef WSAPOLLFD os_pollfd_t;
+#define os_poll WSAPoll
+typedef SSIZE_T ssize_t;
+static volatile LONG g_stop_requested = 0;
+#else
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+typedef int socket_t;
+#define OS_INVALID_SOCKET (-1)
+#define close_socket(s) close(s)
+#define sock_errno() errno
+#define sock_interrupted(e) ((e) == EINTR)
+#define sock_would_block(e) ((e) == EAGAIN || (e) == EWOULDBLOCK)
+typedef struct pollfd os_pollfd_t;
+#define os_poll poll
 static volatile sig_atomic_t g_stop_requested = 0;
-static volatile sig_atomic_t g_listen_fd = -1;
+#endif
+
+static socket_t g_listen_fd = OS_INVALID_SOCKET;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
 
+#ifdef _WIN32
+static BOOL WINAPI stop_console_handler(DWORD ctrl) {
+    switch (ctrl) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+        InterlockedExchange(&g_stop_requested, 1);
+        if (g_listen_fd != OS_INVALID_SOCKET) {
+            socket_t fd = g_listen_fd;
+            g_listen_fd = OS_INVALID_SOCKET;
+            close_socket(fd);
+        }
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+#else
 static void stop_signal_handler(int sig) {
     (void)sig;
     if (g_stop_requested) _exit(130);
     g_stop_requested = 1;
-    if (g_listen_fd >= 0) {
-        int fd = (int)g_listen_fd;
-        g_listen_fd = -1;
-        close(fd);
+    if (g_listen_fd != OS_INVALID_SOCKET) {
+        socket_t fd = g_listen_fd;
+        g_listen_fd = OS_INVALID_SOCKET;
+        close_socket(fd);
     }
 }
+#endif
 
 typedef struct {
     char *ptr;
@@ -81,22 +139,112 @@ static char *xstrdup(const char *s) {
     return p;
 }
 
-static bool random_bytes(void *dst, size_t len) {
-    unsigned char *p = dst;
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) return false;
-    while (len) {
-        ssize_t n = read(fd, p, len);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) {
-            close(fd);
-            return false;
-        }
-        p += (size_t)n;
-        len -= (size_t)n;
+static unsigned long os_process_id(void) {
+#ifdef _WIN32
+    return (unsigned long)GetCurrentProcessId();
+#else
+    return (unsigned long)getpid();
+#endif
+}
+
+static void os_localtime(time_t t, struct tm *out) {
+#ifdef _WIN32
+    localtime_s(out, &t);
+#else
+    localtime_r(&t, out);
+#endif
+}
+
+static int server_mkdir(const char *path) {
+#ifdef _WIN32
+    wchar_t wpath[OS_MAX_PATH_W];
+    if (os_utf8_to_wide(path, wpath, OS_MAX_PATH_W) <= 0) {
+        errno = EINVAL;
+        return -1;
     }
-    close(fd);
+    if (CreateDirectoryW(wpath, NULL)) return 0;
+    DWORD err = GetLastError();
+    if (err == ERROR_ALREADY_EXISTS) {
+        errno = EEXIST;
+        return -1;
+    }
+    errno = EINVAL;
+    return -1;
+#else
+    return mkdir(path, 0700);
+#endif
+}
+
+static bool server_file_size(const char *path, uint64_t *size_out) {
+    os_file_t f;
+    if (os_file_open_read(&f, path) != 0) return false;
+    uint64_t size = os_file_size(&f);
+    os_file_close(&f);
+    if (size == UINT64_MAX) return false;
+    if (size_out) *size_out = size;
     return true;
+}
+
+static int server_rename_replace(const char *tmp, const char *path) {
+#ifdef _WIN32
+    wchar_t wtmp[OS_MAX_PATH_W];
+    wchar_t wpath[OS_MAX_PATH_W];
+    if (os_utf8_to_wide(tmp, wtmp, OS_MAX_PATH_W) <= 0 ||
+        os_utf8_to_wide(path, wpath, OS_MAX_PATH_W) <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (MoveFileExW(wtmp, wpath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
+    errno = EINVAL;
+    return -1;
+#else
+    return rename(tmp, path);
+#endif
+}
+
+static int server_unlink(const char *path) {
+#ifdef _WIN32
+    wchar_t wpath[OS_MAX_PATH_W];
+    if (os_utf8_to_wide(path, wpath, OS_MAX_PATH_W) <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (DeleteFileW(wpath)) return 0;
+    errno = EINVAL;
+    return -1;
+#else
+    return unlink(path);
+#endif
+}
+
+#ifdef DS4_SERVER_TEST
+static int server_rmdir(const char *path) {
+#ifdef _WIN32
+    wchar_t wpath[OS_MAX_PATH_W];
+    if (os_utf8_to_wide(path, wpath, OS_MAX_PATH_W) <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (RemoveDirectoryW(wpath)) return 0;
+    errno = EINVAL;
+    return -1;
+#else
+    return rmdir(path);
+#endif
+}
+#endif
+
+static bool random_bytes(void *dst, size_t len) {
+    return os_random_bytes(dst, len) == 0;
+}
+
+static const char *socket_error_text(int err, char *buf, size_t cap) {
+#ifdef _WIN32
+    snprintf(buf, cap, "socket error %d", err);
+#else
+    snprintf(buf, cap, "%s", strerror(err));
+#endif
+    return buf;
 }
 
 static char *xstrndup(const char *s, size_t n) {
@@ -485,7 +633,7 @@ static void random_tool_id(char *dst, size_t dstlen, api_style api) {
     if (pos >= dstlen) return;
 
     if (!random_bytes(bytes, sizeof(bytes))) {
-        uint64_t a = ((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid();
+        uint64_t a = ((uint64_t)time(NULL) << 32) ^ (uint64_t)os_process_id();
         uint64_t b = ++fallback_ctr ^ (uint64_t)(uintptr_t)dst;
         memcpy(bytes, &a, sizeof(a));
         memcpy(bytes + sizeof(a), &b, sizeof(b));
@@ -2523,27 +2671,30 @@ bad:
 }
 
 static long long wall_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    return (long long)(os_monotonic_sec() * 1000.0);
 }
 
-static bool send_all(int fd, const void *p, size_t n) {
+static bool send_all(socket_t fd, const void *p, size_t n) {
     const char *s = p;
     long long deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
     while (n) {
         if (g_stop_requested) return false;
-        ssize_t w = send(fd, s, n, 0);
-        if (w < 0 && errno == EINTR) continue;
-        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        int chunk = n > (size_t)INT_MAX ? INT_MAX : (int)n;
+        int w = send(fd, s, chunk, 0);
+        int err = w < 0 ? sock_errno() : 0;
+        if (w < 0 && sock_interrupted(err)) continue;
+        if (w < 0 && sock_would_block(err)) {
             long long remaining = deadline - wall_ms();
             if (remaining <= 0) return false;
-            struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+            os_pollfd_t pfd;
+            memset(&pfd, 0, sizeof(pfd));
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
             int timeout = remaining > 50 ? 50 : (int)remaining;
             int rc;
             do {
-                rc = poll(&pfd, 1, timeout);
-            } while (rc < 0 && errno == EINTR);
+                rc = os_poll(&pfd, 1, timeout);
+            } while (rc < 0 && sock_interrupted(sock_errno()));
             if (rc < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
             continue;
         }
@@ -3077,7 +3228,7 @@ static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const 
     buf_putc(b, ']');
 }
 
-static bool http_response(int fd, int code, const char *type, const char *body) {
+static bool http_response(socket_t fd, int code, const char *type, const char *body) {
     const char *reason = code == 200 ? "OK" :
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
@@ -3094,7 +3245,7 @@ static bool http_response(int fd, int code, const char *type, const char *body) 
     return ok;
 }
 
-static bool http_error(int fd, int code, const char *msg) {
+static bool http_error(socket_t fd, int code, const char *msg) {
     buf b = {0};
     buf_puts(&b, "{\"error\":{\"message\":");
     json_escape(&b, msg);
@@ -3107,7 +3258,7 @@ static bool http_error(int fd, int code, const char *msg) {
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
-static bool sse_headers(int fd) {
+static bool sse_headers(socket_t fd) {
     const char *h =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
@@ -3116,7 +3267,7 @@ static bool sse_headers(int fd) {
     return send_all(fd, h, strlen(h));
 }
 
-static bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
+static bool sse_chunk(socket_t fd, const request *r, const char *id, const char *text, const char *finish) {
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -3147,7 +3298,7 @@ static bool sse_chunk(int fd, const request *r, const char *id, const char *text
     return ok;
 }
 
-static bool sse_usage_chunk(int fd, const request *r, const char *id,
+static bool sse_usage_chunk(socket_t fd, const request *r, const char *id,
                             int prompt_tokens, int completion_tokens) {
     if (!r->stream_include_usage) return true;
 
@@ -3171,13 +3322,13 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
     return ok;
 }
 
-static bool sse_done(int fd, const request *r, const char *id,
+static bool sse_done(socket_t fd, const request *r, const char *id,
                      int prompt_tokens, int completion_tokens) {
     return sse_usage_chunk(fd, r, id, prompt_tokens, completion_tokens) &&
            send_all(fd, "data: [DONE]\n\n", 14);
 }
 
-static bool sse_chat_finish(int fd, const request *r, const char *id, const char *content,
+static bool sse_chat_finish(socket_t fd, const request *r, const char *id, const char *content,
                             const char *reasoning, const tool_calls *calls, const char *finish,
                             int prompt_tokens, int completion_tokens) {
     if (!sse_chunk(fd, r, id, NULL, NULL)) return false;
@@ -3316,7 +3467,7 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
                                      bool final);
 
-static bool sse_chat_delta_n(int fd, const request *r, const char *id,
+static bool sse_chat_delta_n(socket_t fd, const request *r, const char *id,
                              const char *field, const char *text, size_t len) {
     if (len == 0) return true;
     buf b = {0};
@@ -3338,7 +3489,7 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
  * hidden tool mode at <...tool_calls>, emits the tool header once the invoke tag
  * is complete, then translates each parameter body into argument deltas while
  * holding only tiny tails for partial closing tags, UTF-8, and DSML entities. */
-static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char *id,
+static bool sse_chat_tool_call_start_delta(socket_t fd, const request *r, const char *id,
                                            int index, const char *tool_id,
                                            const char *name) {
     buf b = {0};
@@ -3357,7 +3508,7 @@ static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char 
     return ok;
 }
 
-static bool sse_chat_tool_call_args_delta_n(int fd, const request *r, const char *id,
+static bool sse_chat_tool_call_args_delta_n(socket_t fd, const request *r, const char *id,
                                             int index, const char *text, size_t len) {
     if (len == 0) return true;
     buf b = {0};
@@ -3818,13 +3969,13 @@ static size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
     return utf8_stream_safe_len(raw, start, limit, false);
 }
 
-static bool openai_tool_emit_args_fragment(int fd, const request *r, const char *id,
+static bool openai_tool_emit_args_fragment(socket_t fd, const request *r, const char *id,
                                            openai_tool_stream *ts,
                                            const char *text, size_t len) {
     return sse_chat_tool_call_args_delta_n(fd, r, id, ts->index, text, len);
 }
 
-static bool openai_tool_emit_string_value(int fd, const request *r, const char *id,
+static bool openai_tool_emit_string_value(socket_t fd, const request *r, const char *id,
                                           openai_tool_stream *ts,
                                           const char *text, size_t len) {
     if (len == 0) return true;
@@ -3839,7 +3990,7 @@ static bool openai_tool_emit_string_value(int fd, const request *r, const char *
     return ok;
 }
 
-static bool openai_tool_emit_param_prefix(int fd, const request *r, const char *id,
+static bool openai_tool_emit_param_prefix(socket_t fd, const request *r, const char *id,
                                           openai_tool_stream *ts,
                                           const char *name, bool is_string) {
     buf frag = {0};
@@ -3895,7 +4046,7 @@ static bool openai_tool_stream_fail(openai_tool_stream *ts) {
     return true;
 }
 
-static bool openai_tool_start_invoke(int fd, server *s, const request *r, const char *id,
+static bool openai_tool_start_invoke(socket_t fd, server *s, const request *r, const char *id,
                                      openai_tool_stream *ts,
                                      const char *raw, size_t raw_len) {
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
@@ -3919,7 +4070,7 @@ static bool openai_tool_start_invoke(int fd, server *s, const request *r, const 
     return true;
 }
 
-static bool openai_tool_start_param(int fd, const request *r, const char *id,
+static bool openai_tool_start_param(socket_t fd, const request *r, const char *id,
                                     openai_tool_stream *ts,
                                     const char *raw, size_t raw_len) {
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
@@ -3945,7 +4096,7 @@ static bool openai_tool_start_param(int fd, const request *r, const char *id,
     return true;
 }
 
-static bool openai_tool_finish_param(int fd, const request *r, const char *id,
+static bool openai_tool_finish_param(socket_t fd, const request *r, const char *id,
                                      openai_tool_stream *ts,
                                      const char *raw, size_t value_end) {
     if (value_end > ts->parse_pos) {
@@ -3963,7 +4114,7 @@ static bool openai_tool_finish_param(int fd, const request *r, const char *id,
     return true;
 }
 
-static bool openai_tool_stream_update(int fd, server *s, const request *r, const char *id,
+static bool openai_tool_stream_update(socket_t fd, server *s, const request *r, const char *id,
                                       openai_tool_stream *ts,
                                       const char *raw, size_t raw_len) {
     while (ts->active && ts->parse_pos < raw_len) {
@@ -4039,7 +4190,7 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
     return true;
 }
 
-static bool openai_sse_stream_update(int fd, server *s, const request *r, const char *id,
+static bool openai_sse_stream_update(socket_t fd, server *s, const request *r, const char *id,
                                      openai_stream *st,
                                      const char *raw, size_t raw_len,
                                      bool final) {
@@ -4121,7 +4272,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
     return true;
 }
 
-static bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
+static bool openai_sse_finish_live(socket_t fd, server *s, const request *r, const char *id,
                                    openai_stream *st, const char *raw,
                                    size_t raw_len, const tool_calls *calls,
                                    const char *finish, int prompt_tokens,
@@ -4158,7 +4309,7 @@ static bool request_uses_structured_stream(const request *r) {
                          request_uses_openai_live_stream(r));
 }
 
-static bool final_response(int fd, const request *r, const char *id, const char *text,
+static bool final_response(socket_t fd, const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
                            int prompt_tokens, int completion_tokens) {
     buf b = {0};
@@ -4256,7 +4407,7 @@ static void append_anthropic_content(buf *b, const char *text, const char *reaso
     buf_putc(b, ']');
 }
 
-static bool anthropic_final_response(int fd, const request *r, const char *id, const char *text,
+static bool anthropic_final_response(socket_t fd, const request *r, const char *id, const char *text,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens) {
     buf b = {0};
@@ -4274,7 +4425,7 @@ static bool anthropic_final_response(int fd, const request *r, const char *id, c
     return ok;
 }
 
-static bool sse_event(int fd, const char *event, const char *data) {
+static bool sse_event(socket_t fd, const char *event, const char *data) {
     buf b = {0};
     buf_puts(&b, "event: ");
     buf_puts(&b, event);
@@ -4309,7 +4460,7 @@ typedef struct {
     bool sent_text;
 } anthropic_stream;
 
-static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
+static bool anthropic_sse_start_live(socket_t fd, const request *r, const char *id,
                                      int prompt_tokens, anthropic_stream *st) {
     buf b = {0};
     json_escape(&b, r->model);
@@ -4330,7 +4481,7 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     return ok;
 }
 
-static bool anthropic_sse_open_block(int fd, anthropic_stream *st,
+static bool anthropic_sse_open_block(socket_t fd, anthropic_stream *st,
                                      anthropic_block_type type) {
     if (st->open_block == type) return true;
     if (st->open_block != ANTH_BLOCK_NONE) return false;
@@ -4354,7 +4505,7 @@ static bool anthropic_sse_open_block(int fd, anthropic_stream *st,
     return ok;
 }
 
-static bool anthropic_sse_delta_live(int fd, const anthropic_stream *st,
+static bool anthropic_sse_delta_live(socket_t fd, const anthropic_stream *st,
                                      anthropic_block_type type,
                                      const char *text, size_t len) {
     if (len == 0) return true;
@@ -4379,7 +4530,7 @@ static bool anthropic_sse_delta_live(int fd, const anthropic_stream *st,
     return ok;
 }
 
-static bool anthropic_sse_close_block_live(int fd, const char *id,
+static bool anthropic_sse_close_block_live(socket_t fd, const char *id,
                                            anthropic_stream *st) {
     if (st->open_block == ANTH_BLOCK_NONE) return true;
 
@@ -4449,7 +4600,7 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
     return utf8_stream_safe_len(raw, start, limit, final);
 }
 
-static bool anthropic_sse_stream_update(int fd, const request *r, const char *id,
+static bool anthropic_sse_stream_update(socket_t fd, const request *r, const char *id,
                                         anthropic_stream *st,
                                         const char *raw, size_t raw_len,
                                         bool final) {
@@ -4529,7 +4680,7 @@ static bool anthropic_sse_stream_update(int fd, const request *r, const char *id
     return true;
 }
 
-static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char *id,
+static bool anthropic_sse_tool_blocks_live(socket_t fd, const request *r, const char *id,
                                            anthropic_stream *st,
                                            const tool_calls *calls) {
     (void)r;
@@ -4571,7 +4722,7 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
     return true;
 }
 
-static bool anthropic_sse_stop_live(int fd, const char *finish,
+static bool anthropic_sse_stop_live(socket_t fd, const char *finish,
                                     int completion_tokens) {
     buf b = {0};
     buf_puts(&b, "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":");
@@ -4584,7 +4735,7 @@ static bool anthropic_sse_stop_live(int fd, const char *finish,
     return ok;
 }
 
-static bool anthropic_sse_finish_live(int fd, const request *r, const char *id,
+static bool anthropic_sse_finish_live(socket_t fd, const request *r, const char *id,
                                       anthropic_stream *st, const char *raw,
                                       size_t raw_len, const tool_calls *calls,
                                       const char *finish, int completion_tokens) {
@@ -4600,15 +4751,13 @@ static bool anthropic_sse_finish_live(int fd, const request *r, const char *id,
 }
 
 static double now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    return os_monotonic_sec();
 }
 
 static void server_log(ds4_log_type type, const char *fmt, ...) {
     time_t now = time(NULL);
     struct tm tm;
-    localtime_r(&now, &tm);
+    os_localtime(now, &tm);
     char ts[16];
     strftime(ts, sizeof(ts), "%m%d %H:%M:%S", &tm);
 
@@ -4721,17 +4870,17 @@ struct server {
     kv_disk_cache kv;
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
-    pthread_mutex_t tool_mu;
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
-    pthread_cond_t clients_cv;
+    os_mutex_t tool_mu;
+    os_mutex_t mu;
+    os_cond_t cv;
+    os_cond_t clients_cv;
     job *head;
     job *tail;
     bool stopping;
     int clients;
     uint64_t seq;
     FILE *trace;
-    pthread_mutex_t trace_mu;
+    os_mutex_t trace_mu;
     uint64_t trace_seq;
 };
 
@@ -4739,11 +4888,11 @@ struct server {
  * after the response has been written, so request data and the socket remain
  * valid without heap-allocating per-request job objects. */
 struct job {
-    int fd;
+    socket_t fd;
     request req;
     bool done;
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
+    os_mutex_t mu;
+    os_cond_t cv;
     job *next;
 };
 
@@ -4937,9 +5086,9 @@ static void tool_memory_free(tool_memory *m) {
 
 static bool tool_memory_has_id(server *s, const char *id) {
     if (!s || s->disable_exact_dsml_tool_replay || !id || !id[0]) return false;
-    pthread_mutex_lock(&s->tool_mu);
+    os_mutex_lock(&s->tool_mu);
     bool found = tool_memory_find_entry_locked(&s->tool_mem, id) != NULL;
-    pthread_mutex_unlock(&s->tool_mu);
+    os_mutex_unlock(&s->tool_mu);
     return found;
 }
 
@@ -4957,21 +5106,21 @@ static const char *tool_memory_lookup_locked(tool_memory *m, const char *id,
 static void tool_memory_remember(server *s, const tool_calls *calls) {
     if (!s || s->disable_exact_dsml_tool_replay ||
         !calls || !calls->raw_dsml || !calls->raw_dsml[0]) return;
-    pthread_mutex_lock(&s->tool_mu);
+    os_mutex_lock(&s->tool_mu);
     for (int i = 0; i < calls->len; i++) {
         tool_memory_put_locked(&s->tool_mem, calls->v[i].id, calls->raw_dsml,
                                TOOL_MEMORY_RAM);
     }
-    pthread_mutex_unlock(&s->tool_mu);
+    os_mutex_unlock(&s->tool_mu);
 }
 
 static void tool_memory_put_source(server *s, const char *id, const char *dsml,
                                    tool_memory_source source) {
     if (!s || s->disable_exact_dsml_tool_replay ||
         !id || !id[0] || !dsml || !dsml[0]) return;
-    pthread_mutex_lock(&s->tool_mu);
+    os_mutex_lock(&s->tool_mu);
     tool_memory_put_locked(&s->tool_mem, id, dsml, source);
-    pthread_mutex_unlock(&s->tool_mu);
+    os_mutex_unlock(&s->tool_mu);
 }
 
 #ifdef DS4_SERVER_TEST
@@ -4994,7 +5143,7 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
         }
         return;
     }
-    pthread_mutex_lock(&s->tool_mu);
+    os_mutex_lock(&s->tool_mu);
     for (int i = 0; i < msgs->len; i++) {
         tool_calls *calls = &msgs->v[i].calls;
         if (calls->len == 0 || calls->raw_dsml) continue;
@@ -5032,7 +5181,7 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
             stats->missing_ids += missing;
         }
     }
-    pthread_mutex_unlock(&s->tool_mu);
+    os_mutex_unlock(&s->tool_mu);
 }
 
 static bool tool_calls_contains_id(const tool_calls *calls, const char *id, int upto) {
@@ -5352,13 +5501,13 @@ static bool mkdir_p(const char *path) {
     for (char *p = tmp + 1; *p; p++) {
         if (*p != '/') continue;
         *p = '\0';
-        if (mkdir(tmp, 0700) != 0 && errno != EEXIST) {
+        if (server_mkdir(tmp) != 0 && errno != EEXIST) {
             free(tmp);
             return false;
         }
         *p = '/';
     }
-    bool ok = mkdir(tmp, 0700) == 0 || errno == EEXIST;
+    bool ok = server_mkdir(tmp) == 0 || errno == EEXIST;
     free(tmp);
     return ok;
 }
@@ -5414,7 +5563,7 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
 static int tool_memory_count_dsml_in_text(server *s, const char *text) {
     if (!s || s->disable_exact_dsml_tool_replay || !text || !text[0]) return 0;
     int count = 0;
-    pthread_mutex_lock(&s->tool_mu);
+    os_mutex_lock(&s->tool_mu);
     const char *p = text;
     for (;;) {
         const char *end = NULL;
@@ -5425,7 +5574,7 @@ static int tool_memory_count_dsml_in_text(server *s, const char *text) {
         if (b) count += b->refs;
         p = end;
     }
-    pthread_mutex_unlock(&s->tool_mu);
+    os_mutex_unlock(&s->tool_mu);
     return count;
 }
 
@@ -5434,7 +5583,7 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
     if (written_bytes) *written_bytes = 0;
     if (!s || s->disable_exact_dsml_tool_replay || !fp || !text || !text[0]) return true;
 
-    pthread_mutex_lock(&s->tool_mu);
+    os_mutex_lock(&s->tool_mu);
     uint32_t count = 0;
     uint64_t bytes = KV_TOOL_MAP_HEADER;
     uint64_t scan = ++s->tool_mem.scan_clock;
@@ -5458,7 +5607,7 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
         p = end;
     }
     if (count == 0) {
-        pthread_mutex_unlock(&s->tool_mu);
+        os_mutex_unlock(&s->tool_mu);
         return true;
     }
 
@@ -5494,7 +5643,7 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
         }
         p = end;
     }
-    pthread_mutex_unlock(&s->tool_mu);
+    os_mutex_unlock(&s->tool_mu);
 
     if (ok && written_bytes) *written_bytes = bytes;
     return ok;
@@ -5579,9 +5728,9 @@ static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
 }
 
 static bool kv_read_entry_file(const char *path, const char sha[41], kv_entry *out) {
-    struct stat st;
-    if (stat(path, &st) != 0 || st.st_size < (off_t)(KV_CACHE_FIXED_HEADER + 4)) return false;
-    FILE *fp = fopen(path, "rb");
+    uint64_t file_size = 0;
+    if (!server_file_size(path, &file_size) || file_size < (uint64_t)(KV_CACHE_FIXED_HEADER + 4)) return false;
+    FILE *fp = os_fopen(path, "rb");
     if (!fp) return false;
     kv_entry e = {0};
     uint32_t text_bytes = 0;
@@ -5592,10 +5741,10 @@ static bool kv_read_entry_file(const char *path, const char sha[41], kv_entry *o
     if (UINT64_MAX - fixed < (uint64_t)text_bytes ||
         UINT64_MAX - fixed - (uint64_t)text_bytes < e.payload_bytes) return false;
     const uint64_t expected = fixed + (uint64_t)text_bytes + e.payload_bytes;
-    if ((uint64_t)st.st_size < expected) return false;
+    if (file_size < expected) return false;
     memcpy(e.sha, sha, 41);
     e.path = xstrdup(path);
-    e.file_size = (uint64_t)st.st_size;
+    e.file_size = file_size;
     *out = e;
     return true;
 }
@@ -5618,7 +5767,7 @@ static void kv_cache_refresh(kv_disk_cache *kc) {
 }
 
 static bool kv_cache_touch_file(const char *path, uint32_t hits) {
-    FILE *fp = fopen(path, "r+b");
+    FILE *fp = os_fopen(path, "r+b");
     if (!fp) return false;
     kv_entry e = {0};
     uint32_t text_bytes = 0;
@@ -5652,7 +5801,7 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
         if (!sha_hex_name(de->d_name, sha)) continue;
         (void)sha;
         char *path = path_join(s->kv.dir, de->d_name);
-        FILE *fp = fopen(path, "rb");
+        FILE *fp = os_fopen(path, "rb");
         free(path);
         if (!fp) continue;
 
@@ -5704,7 +5853,7 @@ static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live) {
             }
         }
         kv_entry e = kc->entry[victim];
-        if (unlink(e.path) == 0) {
+        if (server_unlink(e.path) == 0) {
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: kv cache evicted tokens=%u hits=%u size=%.2f MiB",
                        e.tokens, e.hits, (double)e.file_size / (1024.0 * 1024.0));
@@ -5842,7 +5991,7 @@ static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tok
 static bool kv_cache_file_text_matches(const char *path, const char sha[41],
                                        const char *text, size_t text_len) {
     if (text_len > UINT32_MAX) return false;
-    FILE *fp = fopen(path, "rb");
+    FILE *fp = os_fopen(path, "rb");
     if (!fp) return false;
 
     kv_entry hdr = {0};
@@ -5880,7 +6029,7 @@ static bool kv_cache_existing_compatible(kv_disk_cache *kc, const char *path,
                       kv_cache_file_text_matches(path, sha, text, text_len);
     kv_entry_free(&e);
     if (!compatible) {
-        if (unlink(path) == 0) {
+        if (server_unlink(path) == 0) {
             server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache replaced incompatible file %s", path);
         }
         return false;
@@ -5890,7 +6039,7 @@ static bool kv_cache_existing_compatible(kv_disk_cache *kc, const char *path,
 
 static void kv_cache_rewrite_tool_map(server *s, const char *path, const char *text) {
     if (!s || !path || !text || tool_memory_count_dsml_in_text(s, text) == 0) return;
-    FILE *fp = fopen(path, "r+b");
+    FILE *fp = os_fopen(path, "r+b");
     if (!fp) return;
     kv_entry hdr = {0};
     uint32_t text_bytes = 0;
@@ -5980,10 +6129,10 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     }
 
     buf tmpb = {0};
-    buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
+    buf_printf(&tmpb, "%s.tmp.%ld", path, (long)os_process_id());
     char *tmp = buf_take(&tmpb);
     const double save_t0 = now_sec();
-    FILE *fp = fopen(tmp, "wb");
+    FILE *fp = os_fopen(tmp, "wb");
     if (!fp) {
         server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache failed to create %s: %s save=%.1f ms",
                    tmp, strerror(errno), (now_sec() - save_t0) * 1000.0);
@@ -6015,7 +6164,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
         if (!saved_errno) saved_errno = errno;
         ok = false;
     }
-    if (ok && rename(tmp, path) != 0) {
+    if (ok && server_rename_replace(tmp, path) != 0) {
         saved_errno = errno;
         ok = false;
     }
@@ -6025,7 +6174,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
                    reason,
                    saved_errno ? strerror(saved_errno) : (err[0] ? err : "unknown error"),
                    save_ms);
-        unlink(tmp);
+        server_unlink(tmp);
     } else {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: kv cache stored tokens=%d trimmed=%d reason=%s size=%.2f MiB save=%.1f ms",
@@ -6106,7 +6255,7 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     kv_entry e = kc->entry[idx];
     char *path = xstrdup(e.path);
     const double load_t0 = now_sec();
-    FILE *fp = fopen(path, "rb");
+    FILE *fp = os_fopen(path, "rb");
     if (!fp) {
         free(path);
         return 0;
@@ -6158,7 +6307,7 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
             if (hdr.ext_flags & KV_EXT_TOOL_MAP) kv_tool_map_load_from_pos(s, fp, NULL);
         } else {
             ds4_session_invalidate(s->session);
-            unlink(path);
+            server_unlink(path);
             server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache discarded corrupt text-prefix payload %s", path);
         }
     } else {
@@ -6176,7 +6325,7 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
         if (loaded_path_out) *loaded_path_out = xstrdup(path);
         kc->continued_last_store_tokens = loaded;
         if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
-            unlink(path);
+            server_unlink(path);
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: kv cache hit text tokens=%d text=%u quant=%u load=%.1f ms consumed file=%s",
                        loaded, text_bytes, hdr.quant_bits, load_ms, path);
@@ -6400,7 +6549,7 @@ static void trace_write_cache_diag(
 static void trace_time(FILE *fp) {
     time_t now = time(NULL);
     struct tm tm;
-    localtime_r(&now, &tm);
+    os_localtime(now, &tm);
     char buf[32];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
     fputs(buf, fp);
@@ -6417,7 +6566,7 @@ static uint64_t trace_begin(
         const char *disk_path) {
     if (!s->trace) return 0;
 
-    pthread_mutex_lock(&s->trace_mu);
+    os_mutex_lock(&s->trace_mu);
     uint64_t id = ++s->trace_seq;
     fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
     trace_time(s->trace);
@@ -6457,21 +6606,21 @@ static uint64_t trace_begin(
     }
     fputs("\n--- generated text ---\n", s->trace);
     fflush(s->trace);
-    pthread_mutex_unlock(&s->trace_mu);
+    os_mutex_unlock(&s->trace_mu);
     return id;
 }
 
 static void trace_piece(server *s, uint64_t id, const char *piece, size_t len) {
     if (!s->trace || !id || !piece || !len) return;
-    pthread_mutex_lock(&s->trace_mu);
+    os_mutex_lock(&s->trace_mu);
     fwrite(piece, 1, len, s->trace);
     fflush(s->trace);
-    pthread_mutex_unlock(&s->trace_mu);
+    os_mutex_unlock(&s->trace_mu);
 }
 
 static void trace_event(server *s, uint64_t id, const char *fmt, ...) {
     if (!s->trace || !id) return;
-    pthread_mutex_lock(&s->trace_mu);
+    os_mutex_lock(&s->trace_mu);
     fputs("\n\n--- trace: ", s->trace);
     va_list ap;
     va_start(ap, fmt);
@@ -6479,7 +6628,7 @@ static void trace_event(server *s, uint64_t id, const char *fmt, ...) {
     va_end(ap);
     fputs(" ---\n\n", s->trace);
     fflush(s->trace);
-    pthread_mutex_unlock(&s->trace_mu);
+    os_mutex_unlock(&s->trace_mu);
 }
 
 static void trace_finish(
@@ -6496,7 +6645,7 @@ static void trace_finish(
         double elapsed) {
     if (!s->trace || !id) return;
 
-    pthread_mutex_lock(&s->trace_mu);
+    os_mutex_lock(&s->trace_mu);
     fprintf(s->trace,
             "\n\n--- parsed message ---\nfinish: %s\ngenerated_tokens: %d\ndsml_start: %d\ndsml_end: %d\nelapsed_sec: %.3f\n",
             final_finish,
@@ -6526,7 +6675,7 @@ static void trace_finish(
     }
     fprintf(s->trace, "\n===== end request %llu =====\n", (unsigned long long)id);
     fflush(s->trace);
-    pthread_mutex_unlock(&s->trace_mu);
+    os_mutex_unlock(&s->trace_mu);
 }
 
 typedef struct {
@@ -7480,29 +7629,29 @@ static void generate_job(server *s, job *j) {
 }
 
 static bool enqueue(server *s, job *j) {
-    pthread_mutex_lock(&s->mu);
+    os_mutex_lock(&s->mu);
     if (s->stopping) {
-        pthread_mutex_unlock(&s->mu);
+        os_mutex_unlock(&s->mu);
         return false;
     }
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
-    pthread_cond_signal(&s->cv);
-    pthread_mutex_unlock(&s->mu);
+    os_cond_signal(&s->cv);
+    os_mutex_unlock(&s->mu);
     return true;
 }
 
 static job *dequeue(server *s) {
-    pthread_mutex_lock(&s->mu);
-    while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+    os_mutex_lock(&s->mu);
+    while (!s->head && !s->stopping) os_cond_wait(&s->cv, &s->mu);
     if (!s->head) {
-        pthread_mutex_unlock(&s->mu);
+        os_mutex_unlock(&s->mu);
         return NULL;
     }
     job *j = s->head;
     s->head = j->next;
     if (!s->head) s->tail = NULL;
-    pthread_mutex_unlock(&s->mu);
+    os_mutex_unlock(&s->mu);
     j->next = NULL;
     return j;
 }
@@ -7513,10 +7662,10 @@ static void *worker_main(void *arg) {
         job *j = dequeue(s);
         if (!j) break;
         generate_job(s, j);
-        pthread_mutex_lock(&j->mu);
+        os_mutex_lock(&j->mu);
         j->done = true;
-        pthread_cond_signal(&j->cv);
-        pthread_mutex_unlock(&j->mu);
+        os_cond_signal(&j->cv);
+        os_mutex_unlock(&j->mu);
     }
     return NULL;
 }
@@ -7560,7 +7709,7 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
-static bool read_http_request(int fd, http_request *r) {
+static bool read_http_request(socket_t fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
@@ -7568,8 +7717,9 @@ static bool read_http_request(int fd, http_request *r) {
 
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
-        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0 && errno == EINTR) continue;
+        ssize_t n = recv(fd, tmp, (int)sizeof(tmp), 0);
+        int err = n < 0 ? sock_errno() : 0;
+        if (n < 0 && sock_interrupted(err)) continue;
         if (n <= 0) goto fail;
         buf_append(&b, tmp, (size_t)n);
         hend = header_end(b.ptr, b.len);
@@ -7591,8 +7741,9 @@ static bool read_http_request(int fd, http_request *r) {
     if (clen < 0 || (size_t)clen > max_body) goto fail;
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
-        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0 && errno == EINTR) continue;
+        ssize_t n = recv(fd, tmp, (int)sizeof(tmp), 0);
+        int err = n < 0 ? sock_errno() : 0;
+        if (n < 0 && sock_interrupted(err)) continue;
         if (n <= 0) goto fail;
         buf_append(&b, tmp, (size_t)n);
     }
@@ -7610,7 +7761,7 @@ fail:
 
 typedef struct {
     server *srv;
-    int fd;
+    socket_t fd;
 } client_arg;
 
 static void append_model_json_values(buf *b, int ctx, int default_tokens) {
@@ -7647,7 +7798,7 @@ static void append_model_json(buf *b, const server *s) {
     append_model_json_values(b, ds4_session_ctx(s->session), s->default_tokens);
 }
 
-static bool send_model(server *s, int fd) {
+static bool send_model(server *s, socket_t fd) {
     buf b = {0};
     append_model_json(&b, s);
     buf_putc(&b, '\n');
@@ -7656,7 +7807,7 @@ static bool send_model(server *s, int fd) {
     return ok;
 }
 
-static bool send_models(server *s, int fd) {
+static bool send_models(server *s, socket_t fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
     append_model_json(&b, s);
@@ -7667,18 +7818,18 @@ static bool send_models(server *s, int fd) {
 }
 
 static void client_done(server *s) {
-    pthread_mutex_lock(&s->mu);
+    os_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
-    pthread_cond_broadcast(&s->clients_cv);
-    pthread_mutex_unlock(&s->mu);
+    os_cond_broadcast(&s->clients_cv);
+    os_mutex_unlock(&s->mu);
 }
 
-static void set_client_socket_nonblocking(int fd);
+static void set_client_socket_nonblocking(socket_t fd);
 
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
-    int fd = ca->fd;
+    socket_t fd = ca->fd;
     free(ca);
 
     http_request hr = {0};
@@ -7728,35 +7879,35 @@ static void *client_main(void *arg) {
     memset(&j, 0, sizeof(j));
     j.fd = fd;
     j.req = req;
-    pthread_mutex_init(&j.mu, NULL);
-    pthread_cond_init(&j.cv, NULL);
+    os_mutex_init(&j.mu);
+    os_cond_init(&j.cv);
 
-    pthread_mutex_lock(&j.mu);
+    os_mutex_lock(&j.mu);
     if (!enqueue(s, &j)) {
-        pthread_mutex_unlock(&j.mu);
+        os_mutex_unlock(&j.mu);
         http_error(fd, 503, "server shutting down");
-        pthread_cond_destroy(&j.cv);
-        pthread_mutex_destroy(&j.mu);
+        os_cond_destroy(&j.cv);
+        os_mutex_destroy(&j.mu);
         request_free(&j.req);
         goto done;
     }
-    while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
-    pthread_mutex_unlock(&j.mu);
+    while (!j.done) os_cond_wait(&j.cv, &j.mu);
+    os_mutex_unlock(&j.mu);
 
-    pthread_cond_destroy(&j.cv);
-    pthread_mutex_destroy(&j.mu);
+    os_cond_destroy(&j.cv);
+    os_mutex_destroy(&j.mu);
     request_free(&j.req);
 done:
-    close(fd);
+    close_socket(fd);
     client_done(s);
     return NULL;
 }
 
-static int listen_on(const char *host, int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+static socket_t listen_on(const char *host, int port) {
+    socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == OS_INVALID_SOCKET) return OS_INVALID_SOCKET;
     int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
 
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
@@ -7764,35 +7915,49 @@ static int listen_on(const char *host, int port) {
     sa.sin_port = htons((uint16_t)port);
     if (!strcmp(host, "localhost")) host = "127.0.0.1";
     if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
-        close(fd);
+        close_socket(fd);
+#ifdef _WIN32
+        WSASetLastError(WSAEINVAL);
+#endif
         errno = EINVAL;
-        return -1;
+        return OS_INVALID_SOCKET;
     }
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-        close(fd);
-        return -1;
+        close_socket(fd);
+        return OS_INVALID_SOCKET;
     }
     if (listen(fd, 128) != 0) {
-        close(fd);
-        return -1;
+        close_socket(fd);
+        return OS_INVALID_SOCKET;
     }
     return fd;
 }
 
-static void configure_client_socket(int fd) {
+static void configure_client_socket(socket_t fd) {
+#ifdef _WIN32
+    DWORD timeout = DS4_SERVER_IO_TIMEOUT_SEC * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof(timeout));
+#else
     struct timeval tv;
     tv.tv_sec = DS4_SERVER_IO_TIMEOUT_SEC;
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
 }
 
-static void set_client_socket_nonblocking(int fd) {
+static void set_client_socket_nonblocking(socket_t fd) {
     /* The inference worker writes streaming responses itself.  Once a request is
      * queued, a blocked socket would block every other request too, so slow
      * clients are failed instead of back-pressuring the model session. */
+#ifdef _WIN32
+    u_long nb = 1;
+    (void)ioctlsocket(fd, FIONBIO, &nb);
+#else
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
 }
 
 typedef struct {
@@ -7867,11 +8032,11 @@ static void server_close_resources(server *s) {
     }
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
-    pthread_mutex_destroy(&s->tool_mu);
-    pthread_mutex_destroy(&s->trace_mu);
-    pthread_cond_destroy(&s->clients_cv);
-    pthread_cond_destroy(&s->cv);
-    pthread_mutex_destroy(&s->mu);
+    os_mutex_destroy(&s->tool_mu);
+    os_mutex_destroy(&s->trace_mu);
+    os_cond_destroy(&s->clients_cv);
+    os_cond_destroy(&s->cv);
+    os_mutex_destroy(&s->mu);
     ds4_session_free(s->session);
     ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
@@ -8087,6 +8252,15 @@ static server_config parse_options(int argc, char **argv) {
 
 #ifndef DS4_SERVER_TEST
 int main(int argc, char **argv) {
+    os_console_init();
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "ds4-server: WSAStartup failed\n");
+        return 1;
+    }
+    SetConsoleCtrlHandler(stop_console_handler, TRUE);
+#else
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -8094,11 +8268,17 @@ int main(int argc, char **argv) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+#endif
 
     server_config cfg = parse_options(argc, argv);
 
     ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+    if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return 1;
+    }
 
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
 
@@ -8107,6 +8287,9 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session",
                    ds4_backend_name(cfg.engine.backend));
         ds4_engine_close(engine);
+#ifdef _WIN32
+        WSACleanup();
+#endif
         return 1;
     }
 
@@ -8125,50 +8308,62 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: exact DSML tool replay disabled; tool history uses canonical JSON rendering");
     }
-    pthread_mutex_init(&s.mu, NULL);
-    pthread_cond_init(&s.cv, NULL);
-    pthread_cond_init(&s.clients_cv, NULL);
-    pthread_mutex_init(&s.tool_mu, NULL);
-    pthread_mutex_init(&s.trace_mu, NULL);
+    os_mutex_init(&s.mu);
+    os_cond_init(&s.cv);
+    os_cond_init(&s.clients_cv);
+    os_mutex_init(&s.tool_mu);
+    os_mutex_init(&s.trace_mu);
     if (cfg.trace_path) {
-        s.trace = fopen(cfg.trace_path, "w");
+        s.trace = os_fopen(cfg.trace_path, "w");
         if (!s.trace) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: failed to open trace file %s: %s",
                        cfg.trace_path, strerror(errno));
             server_close_resources(&s);
+#ifdef _WIN32
+            WSACleanup();
+#endif
             return 1;
         }
         setvbuf(s.trace, NULL, _IONBF, 0);
         server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
     }
 
-    pthread_t worker;
-    if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
+    os_thread_t worker;
+    if (os_thread_create(&worker, worker_main, &s) != 0) die("failed to start worker");
 
-    int lfd = listen_on(cfg.host, cfg.port);
-    if (lfd < 0) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to listen on %s:%d: %s", cfg.host, cfg.port, strerror(errno));
-        pthread_mutex_lock(&s.mu);
+    socket_t lfd = listen_on(cfg.host, cfg.port);
+    if (lfd == OS_INVALID_SOCKET) {
+        char ebuf[96];
+        int err = sock_errno();
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to listen on %s:%d: %s",
+                   cfg.host, cfg.port, socket_error_text(err, ebuf, sizeof(ebuf)));
+        os_mutex_lock(&s.mu);
         s.stopping = true;
-        pthread_cond_broadcast(&s.cv);
-        pthread_mutex_unlock(&s.mu);
-        pthread_join(worker, NULL);
+        os_cond_broadcast(&s.cv);
+        os_mutex_unlock(&s.mu);
+        os_thread_join(worker);
         server_close_resources(&s);
+#ifdef _WIN32
+        WSACleanup();
+#endif
         return 1;
     }
     g_listen_fd = lfd;
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
 
     while (!g_stop_requested) {
-        int fd = accept(lfd, NULL, NULL);
-        if (fd < 0) {
+        socket_t fd = accept(lfd, NULL, NULL);
+        if (fd == OS_INVALID_SOCKET) {
+            int err = sock_errno();
             if (g_stop_requested) break;
-            if (errno == EINTR) continue;
-            server_log(DS4_LOG_DEFAULT, "ds4-server: accept failed: %s", strerror(errno));
+            if (sock_interrupted(err)) continue;
+            char ebuf[96];
+            server_log(DS4_LOG_DEFAULT, "ds4-server: accept failed: %s",
+                       socket_error_text(err, ebuf, sizeof(ebuf)));
             continue;
         }
         if (g_stop_requested) {
-            close(fd);
+            close_socket(fd);
             break;
         }
 
@@ -8176,35 +8371,35 @@ int main(int argc, char **argv) {
         client_arg *ca = xmalloc(sizeof(*ca));
         ca->srv = &s;
         ca->fd = fd;
-        pthread_mutex_lock(&s.mu);
+        os_mutex_lock(&s.mu);
         s.clients++;
-        pthread_mutex_unlock(&s.mu);
-        pthread_t th;
-        if (pthread_create(&th, NULL, client_main, ca) != 0) {
-            pthread_mutex_lock(&s.mu);
+        os_mutex_unlock(&s.mu);
+        os_thread_t th;
+        if (os_thread_create(&th, client_main, ca) != 0) {
+            os_mutex_lock(&s.mu);
             s.clients--;
-            pthread_cond_broadcast(&s.clients_cv);
-            pthread_mutex_unlock(&s.mu);
+            os_cond_broadcast(&s.clients_cv);
+            os_mutex_unlock(&s.mu);
             free(ca);
-            close(fd);
+            close_socket(fd);
             continue;
         }
-        pthread_detach(th);
+        os_thread_detach(th);
     }
-    if (g_listen_fd >= 0) {
-        close(lfd);
-        g_listen_fd = -1;
+    if (g_listen_fd != OS_INVALID_SOCKET) {
+        close_socket(lfd);
+        g_listen_fd = OS_INVALID_SOCKET;
     }
 
     server_log(DS4_LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
-    pthread_mutex_lock(&s.mu);
+    os_mutex_lock(&s.mu);
     s.stopping = true;
-    pthread_cond_broadcast(&s.cv);
-    pthread_mutex_unlock(&s.mu);
-    pthread_join(worker, NULL);
-    pthread_mutex_lock(&s.mu);
-    while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
-    pthread_mutex_unlock(&s.mu);
+    os_cond_broadcast(&s.cv);
+    os_mutex_unlock(&s.mu);
+    os_thread_join(worker);
+    os_mutex_lock(&s.mu);
+    while (s.clients > 0) os_cond_wait(&s.clients_cv, &s.mu);
+    os_mutex_unlock(&s.mu);
 
     const ds4_tokens *tokens = ds4_session_tokens(s.session);
     if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
@@ -8214,6 +8409,9 @@ int main(int argc, char **argv) {
         kv_cache_store_current(&s, "shutdown");
     }
     server_close_resources(&s);
+#ifdef _WIN32
+    WSACleanup();
+#endif
     return 0;
 }
 #else
@@ -8282,7 +8480,7 @@ static tool_schema_orders make_bash_order(void) {
     return orders;
 }
 
-static char *read_socket_text(int fd) {
+static char *read_socket_text(socket_t fd) {
     buf b = {0};
     char tmp[1024];
     ssize_t n;
@@ -8346,8 +8544,8 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     free(out);
     tool_calls_free(&calls);
     request_free(&r);
-    close(sv[0]);
-    close(sv[1]);
+    close_socket(sv[0]);
+    close_socket(sv[1]);
 }
 
 static void test_openai_tool_stream_sends_incremental_text(void) {
@@ -8404,8 +8602,8 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
     free(out);
     tool_calls_free(&calls);
     request_free(&r);
-    close(sv[0]);
-    close(sv[1]);
+    close_socket(sv[0]);
+    close_socket(sv[1]);
 }
 
 static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
@@ -8458,8 +8656,8 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     free(out);
     openai_stream_free(&st);
     request_free(&r);
-    close(sv[0]);
-    close(sv[1]);
+    close_socket(sv[0]);
+    close_socket(sv[1]);
 }
 
 static void test_openai_tool_stream_sends_partial_arguments(void) {
@@ -8538,8 +8736,8 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     tool_calls_free(&calls);
     openai_stream_free(&st);
     request_free(&r);
-    close(sv[0]);
-    close(sv[1]);
+    close_socket(sv[0]);
+    close_socket(sv[1]);
 }
 
 static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
@@ -8579,8 +8777,8 @@ static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
     free(out);
     openai_stream_free(&st);
     request_free(&r);
-    close(sv[0]);
-    close(sv[1]);
+    close_socket(sv[0]);
+    close_socket(sv[1]);
 }
 
 static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
@@ -8615,8 +8813,8 @@ static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
     free(out);
     openai_stream_free(&st);
     request_free(&r);
-    close(sv[0]);
-    close(sv[1]);
+    close_socket(sv[0]);
+    close_socket(sv[1]);
 }
 
 static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
@@ -8659,8 +8857,8 @@ static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
     free(out);
     openai_stream_free(&st);
     request_free(&r);
-    close(sv[0]);
-    close(sv[1]);
+    close_socket(sv[0]);
+    close_socket(sv[1]);
 }
 
 static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
@@ -8714,8 +8912,8 @@ static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
     buf_free(&complete);
     openai_stream_free(&st);
     request_free(&r);
-    close(sv[0]);
-    close(sv[1]);
+    close_socket(sv[0]);
+    close_socket(sv[1]);
 }
 
 static void test_openai_tool_stream_handles_multiple_calls(void) {
@@ -8758,8 +8956,8 @@ static void test_openai_tool_stream_handles_multiple_calls(void) {
     free(out);
     openai_stream_free(&st);
     request_free(&r);
-    close(sv[0]);
-    close(sv[1]);
+    close_socket(sv[0]);
+    close_socket(sv[1]);
 }
 
 static void test_streaming_holds_partial_utf8(void) {
@@ -8799,8 +8997,8 @@ static void test_streaming_holds_partial_utf8(void) {
     free(out);
     openai_stream_free(&st);
     request_free(&r);
-    close(sv[0]);
-    close(sv[1]);
+    close_socket(sv[0]);
+    close_socket(sv[1]);
 }
 
 static void test_request_defaults_match_deepseek_api(void) {
@@ -9274,7 +9472,7 @@ static void test_tool_memory_replays_sampled_dsml(void) {
 
     server s;
     memset(&s, 0, sizeof(s));
-    pthread_mutex_init(&s.tool_mu, NULL);
+    os_mutex_init(&s.tool_mu);
     assign_tool_call_ids(&s, &sampled, API_OPENAI);
     TEST_ASSERT(sampled.v[0].id != NULL);
     TEST_ASSERT(!strncmp(sampled.v[0].id, "call_", 5));
@@ -9315,7 +9513,7 @@ static void test_tool_memory_replays_sampled_dsml(void) {
     free(reasoning);
     tool_calls_free(&sampled);
     tool_memory_free(&s.tool_mem);
-    pthread_mutex_destroy(&s.tool_mu);
+    os_mutex_destroy(&s.tool_mu);
 }
 
 static void test_exact_dsml_tool_replay_can_be_disabled(void) {
@@ -9327,7 +9525,7 @@ static void test_exact_dsml_tool_replay_can_be_disabled(void) {
         "</｜DSML｜tool_calls>";
 
     server s = {0};
-    pthread_mutex_init(&s.tool_mu, NULL);
+    os_mutex_init(&s.tool_mu);
     tool_memory_put(&s, "call_disabled", dsml);
     s.disable_exact_dsml_tool_replay = true;
 
@@ -9356,7 +9554,7 @@ static void test_exact_dsml_tool_replay_can_be_disabled(void) {
     if (fp) fclose(fp);
     chat_msgs_free(&msgs);
     tool_memory_free(&s.tool_mem);
-    pthread_mutex_destroy(&s.tool_mu);
+    os_mutex_destroy(&s.tool_mu);
 }
 
 static void test_dsml_decode_state_separates_structure_and_payload(void) {
@@ -9428,7 +9626,7 @@ static void test_tool_memory_max_ids_prunes_oldest(void) {
     const char *c_dsml = "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">c</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
 
     server s = {0};
-    pthread_mutex_init(&s.tool_mu, NULL);
+    os_mutex_init(&s.tool_mu);
     s.tool_mem.max_entries = 2;
     tool_memory_put(&s, "call_a", a_dsml);
     tool_memory_put(&s, "call_b", b_dsml);
@@ -9449,7 +9647,7 @@ static void test_tool_memory_max_ids_prunes_oldest(void) {
 
     chat_msgs_free(&msgs);
     tool_memory_free(&s.tool_mem);
-    pthread_mutex_destroy(&s.tool_mu);
+    os_mutex_destroy(&s.tool_mu);
 }
 
 static void test_tool_separator_whitespace_is_not_content(void) {
@@ -9590,8 +9788,8 @@ static void test_client_socket_nonblocking_flag(void) {
     int flags = fcntl(sv[0], F_GETFL, 0);
     TEST_ASSERT(flags >= 0);
     TEST_ASSERT((flags & O_NONBLOCK) != 0);
-    close(sv[0]);
-    close(sv[1]);
+    close_socket(sv[0]);
+    close_socket(sv[1]);
 }
 
 static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
@@ -9735,7 +9933,7 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     char name[44];
     snprintf(name, sizeof(name), "%.40s.kv", sha);
     char *path = path_join(dir, name);
-    FILE *fp = fopen(path, "wb");
+    FILE *fp = os_fopen(path, "wb");
     TEST_ASSERT(fp != NULL);
     if (!fp) {
         free(path);
@@ -9761,7 +9959,7 @@ static void test_kv_text_stub_file(const char *dir, const char *text,
     char name[44];
     snprintf(name, sizeof(name), "%.40s.kv", sha);
     char *path = path_join(dir, name);
-    FILE *fp = fopen(path, "wb");
+    FILE *fp = os_fopen(path, "wb");
     TEST_ASSERT(fp != NULL);
     if (!fp) {
         free(path);
@@ -9815,11 +10013,11 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     snprintf(long_name, sizeof(long_name), "%.40s.kv", long_sha);
     char *short_path = path_join(dir, short_name);
     char *long_path = path_join(dir, long_name);
-    unlink(short_path);
-    unlink(long_path);
+    server_unlink(short_path);
+    server_unlink(long_path);
     free(short_path);
     free(long_path);
-    rmdir(dir);
+    server_rmdir(dir);
 }
 
 static void test_kv_tool_map_filters_by_dsml_text(void) {
@@ -9837,8 +10035,8 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
         "</｜DSML｜tool_calls>";
 
     server src = {0}, dst = {0};
-    pthread_mutex_init(&src.tool_mu, NULL);
-    pthread_mutex_init(&dst.tool_mu, NULL);
+    os_mutex_init(&src.tool_mu);
+    os_mutex_init(&dst.tool_mu);
     tool_memory_put(&src, "call_keep", dsml_keep);
     tool_memory_put(&src, "call_drop", dsml_drop);
 
@@ -9875,8 +10073,8 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
     if (fp) fclose(fp);
     tool_memory_free(&src.tool_mem);
     tool_memory_free(&dst.tool_mem);
-    pthread_mutex_destroy(&src.tool_mu);
-    pthread_mutex_destroy(&dst.tool_mu);
+    os_mutex_destroy(&src.tool_mu);
+    os_mutex_destroy(&dst.tool_mu);
 }
 
 static void test_kv_tool_map_restores_before_prompt_render(void) {
@@ -9898,10 +10096,10 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     const char *text = dsml;
 
     server src = {0};
-    pthread_mutex_init(&src.tool_mu, NULL);
+    os_mutex_init(&src.tool_mu);
     tool_memory_put(&src, "call_disk", dsml);
 
-    FILE *fp = fopen(path, "wb");
+    FILE *fp = os_fopen(path, "wb");
     TEST_ASSERT(fp != NULL);
     if (fp) {
         uint8_t h[KV_CACHE_FIXED_HEADER];
@@ -9917,7 +10115,7 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     }
 
     server dst = {0};
-    pthread_mutex_init(&dst.tool_mu, NULL);
+    os_mutex_init(&dst.tool_mu);
     dst.kv.enabled = true;
     dst.kv.dir = xstrdup(dir);
     dst.kv.opt = kv_cache_default_options();
@@ -9947,11 +10145,11 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     kv_cache_close(&dst.kv);
     tool_memory_free(&src.tool_mem);
     tool_memory_free(&dst.tool_mem);
-    pthread_mutex_destroy(&src.tool_mu);
-    pthread_mutex_destroy(&dst.tool_mu);
-    unlink(path);
+    os_mutex_destroy(&src.tool_mu);
+    os_mutex_destroy(&dst.tool_mu);
+    server_unlink(path);
     free(path);
-    rmdir(dir);
+    server_rmdir(dir);
 }
 
 static void test_kv_cache_eviction_values_fresh_snapshots(void) {
@@ -9982,11 +10180,11 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     TEST_ASSERT(access(new_path, F_OK) == 0);
 
     kv_cache_close(&kc);
-    unlink(old_path);
-    unlink(new_path);
+    server_unlink(old_path);
+    server_unlink(new_path);
     free(old_path);
     free(new_path);
-    rmdir(dir);
+    server_rmdir(dir);
 }
 
 static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
@@ -10017,11 +10215,11 @@ static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     TEST_ASSERT(access(continued_path, F_OK) == 0);
 
     kv_cache_close(&kc);
-    unlink(cold_path);
-    unlink(continued_path);
+    server_unlink(cold_path);
+    server_unlink(continued_path);
     free(cold_path);
     free(continued_path);
-    rmdir(dir);
+    server_rmdir(dir);
 }
 
 static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
