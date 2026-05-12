@@ -144,9 +144,15 @@ void os_file_close     (os_file_t *f);
 // 返回实际读取字节数，<0 表示错误。
 int64_t os_pread(os_file_t *f, void *buf, uint64_t len, uint64_t off);
 
-// 大小（uint64_t），统一替代 fstat/_fstat64
-uint64_t os_file_size(os_file_t *f);
+// 文件大小。失败返回 UINT64_MAX（用 errno / GetLastError 拿具体错误）。
+// 80GB 模型必须保证返回值是 uint64_t 而非 32-bit off_t。
+// Linux: fstat(f->fd, &st) -> (uint64_t)st.st_size
+// Windows: _fstat64(_open_osfhandle((intptr_t)f->h, _O_RDONLY), &st64) -> (uint64_t)st64.st_size
+//          或更直接：GetFileSizeEx(f->h, &li) -> (uint64_t)li.QuadPart
+uint64_t os_file_size(const os_file_t *f);
 ```
+
+`os_mmap_open` 内部调 `os_file_size` 拿尺寸，避免在 `os_mmap.c` 里重复一份 `_fstat64` / `fstat`。
 
 `ds4_gpu.h` API 改造：
 
@@ -192,7 +198,32 @@ HANDLE hMap  = CreateFileMappingW(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
 void *addr   = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
 ```
 
-UTF-8 → UTF-16 抽到 `os_path.h::os_utf8_to_wide(const char*, wchar_t*, size_t)`。**长路径**（>260）需 `\\?\` 前缀；首版不处理，留 TODO。
+UTF-8 → UTF-16 抽到 `os_path.h::os_utf8_to_wide(const char*, wchar_t*, size_t)`。
+
+**长路径处理（v1 实施）**：`os_utf8_to_wide` 内部对 UTF-16 长度 > 248 字符的绝对路径自动加 `\\?\` 前缀（保留 12 字符冗余给文件名扩展）：
+
+```c
+// os_path.h
+int os_utf8_to_wide(const char *utf8, wchar_t *out, size_t out_cap) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (n <= 0) return -1;
+
+    // 绝对路径且长度逼近 MAX_PATH 时加 \\?\ 前缀
+    int needs_prefix = (n > 248)
+                    && (utf8[0] != '\\' || utf8[1] != '\\')   // 不重复加
+                    && ((utf8[1] == ':') || (utf8[0] == '/'));
+
+    if (needs_prefix) {
+        if ((size_t)(n + 4) > out_cap) return -2;
+        wcscpy(out, L"\\\\?\\");
+        return MultiByteToWideChar(CP_UTF8, 0, utf8, -1, out + 4, (int)(out_cap - 4));
+    }
+    if ((size_t)n > out_cap) return -2;
+    return MultiByteToWideChar(CP_UTF8, 0, utf8, -1, out, (int)out_cap);
+}
+```
+
+注意 `\\?\` 前缀会禁用 `/` → `\` 规范化，因此调用方传入的 UTF-8 路径必须已经是 Windows 形式（或在 `os_path.h` 里再加一个 `os_normalize_slashes`）。模型路径 / KV cache 目录在配置阶段统一规范化一次即可。`MAX_PATH_W` 取 32768（Windows 单段最大路径）。
 
 **`os_mmap_warm`**：Windows 用 `PrefetchVirtualMemory`（Win8+），Linux 用 `posix_madvise(WILLNEED)`。
 
@@ -295,7 +326,27 @@ NVIDIA CUDA 文档明确：Windows 上 managed memory 需通过 `cudaMallocManag
 
 改动估计 **30~50 行**，触及 3 个函数的控制流分支。
 
-**附注**：WDDM 下 pinned host memory (`cudaMallocHost`) 上限受 OS 主导分页约束，比 Linux 低；BAR1 在桌面 GPU 通常 256MiB。`cuda_model_copy_chunked` 的 chunk 大小建议在 Windows 上默认调小（256MiB → 64MiB），保留 env 旋钮可调。
+**附注：Windows chunk 大小策略**
+
+WDDM 下 pinned host memory (`cudaMallocHost`) 上限受 OS 主导分页约束，比 Linux 低；BAR1 在桌面 GPU 通常 256MiB（4090 等消费卡）到 4-8GiB（A100/H100 在 Windows Server 上）。固定值不能覆盖所有目标硬件。
+
+`cuda_model_copy_chunked` 的 chunk 大小走两级策略：
+
+```c
+// 1. 自动探测（默认）：基于 BAR1 大小给出保守值
+size_t pick_default_chunk_bytes(void) {
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    // 桌面 WDDM 卡 BAR1 通常 256MiB；按 1/4 ~ 1/2 取一个不会饿死 GPU 的值
+    size_t chunk = 64ull * 1024 * 1024;            // 64MiB 起步
+    if (total_b >= (16ull << 30)) chunk = 256ull * 1024 * 1024;  // >=16GiB 显存放大到 256MiB
+    return chunk;
+}
+
+// 2. 用户旋钮：env DS4_CUDA_COPY_CHUNK_MIB=128 覆盖（同时存在于 Linux 路径）
+```
+
+Windows v1 默认从 64MiB 起步；用户可通过 `DS4_CUDA_COPY_CHUNK_MIB` 环境变量调高。chunk 大小是 §六 验收指标里"加载时间 / 显存峰值"的直接影响变量，应在 D7 记录至少 64MiB / 128MiB / 256MiB 三档基线，写入 follow-up issue 决定后续默认值。
 
 ### 3.5 线程 — `os_thread.h / os_thread.c`
 
@@ -306,6 +357,13 @@ NVIDIA CUDA 文档明确：Windows 上 managed memory 需通过 `cudaMallocManag
 
   // ⚠ 用 SRWLOCK 而非 CRITICAL_SECTION：CRITICAL_SECTION 是递归锁，
   //    会掩盖代码中意外的重入 deadlock bug。
+  // ⚠ 前置审查项（D2 必做）：grep 所有 pthread_mutex_lock 调用点，
+  //    确认没有同一线程内嵌套对同一把锁加锁的模式。若发现，单独
+  //    typedef os_recursive_mutex_t（基于 CRITICAL_SECTION），不要
+  //    把整体默认改回递归锁——会让其它 99% 的非递归用法失去 deadlock
+  //    早暴露的好处。当前 grep 结果（ds4.c + ds4_server.c）显示无明显
+  //    递归模式，但 D2 实施时必须二次确认 worker pool + KV cache 两处
+  //    锁的调用栈。
   typedef SRWLOCK os_mutex_t;
   #define os_mutex_init(m)    InitializeSRWLock(m)
   #define os_mutex_lock(m)    AcquireSRWLockExclusive(m)
@@ -420,7 +478,23 @@ void os_thread_join(os_thread_t t) {
 - `int fd` 用作 socket 的所有位置改为 `socket_t`（含 `send_all` / `recv` / 各 handler 函数签名），约 30 处
 - 监听/连接 socket 的关闭点统一 `close_socket(s)` 宏
 - **socket 错误码全部从 `errno` 改为 `sock_errno()`**（Windows 上 `errno` 与 socket 无关）
-- **`send()` / `recv()` 长度参数是 `int`，单次最多 ~2GiB**：当前 `send_all` 已是循环，但需确认 `n` 没有 `size_t` 直接传入
+- **`send()` / `recv()` 长度参数是 `int`，单次最多 ~2GiB**：当前 `send_all` 已是循环；为防隐式截断，把 helper 签名显式收窄到 `int`，调用方处的 `size_t` 必须在循环里手动 clamp：
+
+```c
+// 显式收窄，调用方传入 size_t 会触发编译器 narrowing 警告（/W3 下）
+static bool send_all(socket_t fd, const void *p, int n);
+
+// 调用方循环（典型用法）：
+size_t remain = total;
+const char *cur = buf;
+while (remain > 0) {
+    int chunk = (remain > (size_t)INT_MAX) ? INT_MAX : (int)remain;
+    if (!send_all(fd, cur, chunk)) return false;
+    cur += chunk; remain -= (size_t)chunk;
+}
+```
+
+- **最低 Windows 版本要求**：Winsock2 + WSAPoll 要求 **Windows Vista / Server 2008 及以上**；CONDITION_VARIABLE / SRWLOCK 同样 Vista+；BCryptGenRandom 是 Vista+；`SetThreadDescription` 等更新的 API 我们不使用。README 与 `CMakeLists.txt` 顶部都明示 `WINVER=_WIN32_WINNT_WIN7 (0x0601)` 作为最低支持。
 - `main` 入口先 `wsock_init`，正常退出前 `wsock_cleanup`
 - `poll()` → `WSAPoll()`。当前 `ds4_server.c:2541` 只用 `POLLOUT + timeout` 做发送超时，**不踩 WSAPoll 已知 bug**（WSAPoll 不上报 connect 失败的 POLLERR/POLLHUP，Microsoft 公开承认）；代码注释中明示，避免后续误用
 - **Ctrl+C / 退出路径**：不能在 Windows signal handler 里直接 `close(int fd)`（fd 是 socket）。通过 `SetConsoleCtrlHandler` 设置 atomic shutdown flag，让 main loop 在下一次 `WSAPoll` timeout 时检查并退出
@@ -558,6 +632,8 @@ D6 与 D7 历史上是 Windows + CUDA 项目最容易超时的两天，建议预
    - 显存峰值
    - 进程 working set 峰值
 9. CTest 全绿（D7 接入的单测）
+10. **长路径冒烟**：用 ≥270 字符的模型路径（自动加 `\\?\` 前缀路径）跑一次模型加载，确认不报 `ERROR_PATH_NOT_FOUND`
+11. **chunk 大小基线**：D7 记录 64MiB / 128MiB / 256MiB 三档下的模型加载时间与显存峰值，存档便于后续默认值调优
 
 ---
 
@@ -576,14 +652,16 @@ D6 与 D7 历史上是 Windows + CUDA 项目最容易超时的两天，建议预
 | Pinned host memory 上限低于 Linux | 中 | chunk 默认在 Windows 上调小（256MiB → 64MiB）并保留 env 旋钮 |
 | Buffered I/O 在多源内存压力下性能回退 | 中 | 列入 §六 指标记录；若回退显著再评估 `FILE_FLAG_NO_BUFFERING`（需对齐 offset/buffer/size） |
 | `_beginthreadex` vs `CreateThread` CRT 状态泄漏 | 低 | 统一走 `_beginthreadex`；`os_thread_join` 内 `CloseHandle` |
-| 长路径 (>260 字符) | 低 | 首版不处理；后续如需加 `\\?\` 前缀 |
-| 双构建系统 (Makefile + CMake) 漂移 | 中 | CI 同时跑两条；新功能必须同时改两边或在 PR 描述里显式标注 |
+| 双构建系统 (Makefile + CMake) 漂移 | 中 | **GitHub Actions matrix**：`ubuntu-latest` 跑 Makefile（CPU + CUDA via container），`windows-latest` 跑 CMake + MSVC + CUDA。任一失败 PR 不可合并。新功能必须同时改两边或在 PR 描述里显式标注 |
+| SRWLOCK 在意外递归调用点死锁 | 低 | D2 实施前 grep 所有 `pthread_mutex_lock` 调用栈；worker pool + KV cache 两处重点审查 |
+| 长路径 (`\\?\` 前缀) 兼容性 | 低 | `os_utf8_to_wide` 自动加前缀；§六 验收第 10 项冒烟测试 |
 
 ---
 
 ## 八、未决项 / Follow-up（不在 v1 实施计划内）
 
 - Windows one-shot CLI / diagnostics（重构 `ds4_cli.c` 剥离 linenoise）
+- `GitHub Actions` workflow 文件：matrix 跑 Linux Makefile + Windows CMake，触发于所有 PR（与"双构建系统漂移"风险对策对齐）
 - `cudaMallocManaged` benchmark vs staged copy
 - `cudaHostRegisterReadOnly` + 设备能力查询，对自分配 pinned buffer 是否有收益
 - KV cache 文件锁在跨进程多 server 实例下的语义（`LockFileEx` vs `flock` 在网络盘上的差异）
