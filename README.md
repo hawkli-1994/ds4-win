@@ -53,6 +53,27 @@ However, we try to keep the project in a usable state, and we are making
 progresses. If you have issues, make sure to use `--trace` to log the
 sessions, and open issues including the full trace.
 
+## More Documentation
+
+If you are looking for very specific things, we have other
+sub-README files. Otherwise for normal usage keep reading the
+next sections.
+
+- [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
+  imatrix collection, quantization tooling, and quality checks.
+- [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
+  routed-MoE imatrix is collected and used.
+- [gguf-tools/imatrix/dataset/README.md](gguf-tools/imatrix/dataset/README.md):
+  how the calibration prompt corpus is generated.
+- [gguf-tools/quality-testing/README.md](gguf-tools/quality-testing/README.md):
+  how local GGUFs are scored against official DeepSeek V4 Flash continuations.
+- [dir-steering/README.md](dir-steering/README.md): directional steering data,
+  vector generation, and usage.
+- [speed-bench/README.md](speed-bench/README.md): benchmark CSV files and graph
+  generation.
+- [tests/test-vectors/README.md](tests/test-vectors/README.md): official
+  continuation vectors used for regression checks.
+
 ## Model Weights
 
 This implementation only works with the DeepSeek V4 Flash GGUFs published for
@@ -87,6 +108,11 @@ model. The plain q2 XXS weights are produced with the weights importance vector
 only, without an imatrix. The imatrix variants are preferred.
 Authentication is optional for public downloads, but `--token TOKEN`,
 `HF_TOKEN`, or the local Hugging Face token cache are used when present.
+
+If you want to regenerate GGUF files or collect a new imatrix, see
+[gguf-tools/README.md](gguf-tools/README.md). Those tools are meant for offline
+model-building work and can take a long time on the full DeepSeek V4 Flash
+weights.
 
 `./download_model.sh mtp` fetches the optional speculative decoding support
 GGUF. It can be used with q2-imatrix, q4-imatrix, q2, and q4, but must be
@@ -123,7 +149,7 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
 | DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
 
-![M3 Max t/s](bench/m3_max_ts.svg)
+![M3 Max t/s](speed-bench/m3_max_ts.svg)
 
 ## Benchmarking
 
@@ -137,7 +163,7 @@ greedy non-EOS probe, restores the memory snapshot, and continues prefill.
 ```sh
 ./ds4-bench \
   -m ds4flash.gguf \
-  --prompt-file bench/promessi_sposi.txt \
+  --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start 2048 \
   --ctx-max 65536 \
   --step-incr 2048 \
