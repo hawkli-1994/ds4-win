@@ -17,6 +17,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <io.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -660,6 +661,15 @@ static int cuda_model_load_progress_enabled(void) {
     return 1;
 }
 
+static int cuda_stderr_is_tty(void) {
+#ifdef _WIN32
+    const int fd = _fileno(stderr);
+    return fd >= 0 && _isatty(fd) != 0;
+#else
+    return isatty(STDERR_FILENO) != 0;
+#endif
+}
+
 static void cuda_model_load_progress_reset(void) {
     g_model_load_progress_next = 0;
     g_model_load_progress_last = 0.0;
@@ -673,7 +683,7 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
     const double now = cuda_wall_sec();
     if (!g_model_load_progress_started) {
         g_model_load_progress_started = 1;
-        g_model_load_progress_tty = isatty(STDERR_FILENO) != 0;
+        g_model_load_progress_tty = cuda_stderr_is_tty();
         g_model_load_progress_next = (g_model_load_progress_tty ? 2ull : 16ull) *
                                      1024ull * 1024ull * 1024ull;
         g_model_load_progress_last = now;
