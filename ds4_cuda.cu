@@ -94,6 +94,33 @@ static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
 
+static void cuda_log_full_model_alloc_failure(uint64_t model_size,
+                                              cudaError_t err,
+                                              const char *mode) {
+    size_t free_b = 0, total_b = 0;
+    cudaError_t mem_err = cudaMemGetInfo(&free_b, &total_b);
+    fprintf(stderr,
+            "ds4: CUDA full-model allocation failed in %s mode: %s\n",
+            mode ? mode : "copy",
+            cudaGetErrorString(err));
+    if (mem_err == cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA model image is %.2f GiB; device memory free %.2f GiB / total %.2f GiB\n",
+                (double)model_size / 1073741824.0,
+                (double)free_b / 1073741824.0,
+                (double)total_b / 1073741824.0);
+    }
+#ifdef _WIN32
+    fprintf(stderr,
+            "ds4: Windows CUDA currently requires copying the full model image "
+            "to device memory before startup; system RAM cannot satisfy this allocation.\n");
+#else
+    fprintf(stderr,
+            "ds4: Full-model CUDA copy requires enough device memory for the whole "
+            "model image; unset copy/preload options to allow Linux mapping/cache fallbacks.\n");
+#endif
+}
+
 struct cuda_model_range {
     const void *host_base;
     uint64_t offset;
@@ -1142,7 +1169,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     const double t0 = cuda_wall_sec();
     cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA model allocation skipped: %s\n", cudaGetErrorString(err));
+        cuda_log_full_model_alloc_failure(model_size, err, "chunk-copy");
         (void)cudaGetLastError();
         return 0;
     }
@@ -1435,7 +1462,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
             (void)cudaFree(dev);
             (void)cudaGetLastError();
         } else {
-            fprintf(stderr, "ds4: CUDA model allocation skipped: %s\n", cudaGetErrorString(err));
+            cuda_log_full_model_alloc_failure(model_size, err, "explicit-copy");
             (void)cudaGetLastError();
         }
     }
