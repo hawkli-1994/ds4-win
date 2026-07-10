@@ -10,6 +10,9 @@ Files:
 - `prompts/*.txt`: exact user prompts.
 - `official/*.official.json`: official API continuations and top-logprobs.
 - `official.vec`: compact C-test fixture generated from the official JSON.
+- `local-golden.vec`: local top-k/logit fixture captured from a known-sane DS4
+  Flash run. It is used to catch substantial backend drift that can keep the
+  same greedy token while damaging the logits distribution.
 
 Regenerate official vectors:
 
@@ -24,6 +27,27 @@ The C runner consumes `official.vec` directly:
 ```sh
 ./ds4_test --logprob-vectors
 ```
+
+It also consumes the local golden fixture:
+
+```sh
+./ds4_test --local-golden-vectors
+```
+
+The Metal SSD-streaming cache-pressure repro for issue #384 is a focused
+variant of the official-vector check. It forces a 16GiB routed-expert cache and
+runs only the `short_code_completion` case that exposes wrong logits when
+layer-batched decode reuses expert-cache buffers before the command buffer has
+completed:
+
+```sh
+DS4_TEST_MODEL=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  ./ds4_test --metal-ssd-streaming-cache-pressure
+```
+
+The runner opens the normal non-quality path with accelerator-specific fast
+routes disabled and pins `DS4_METAL_PREFILL_CHUNK=2048` for this strict
+official-vector check.
 
 `official.vec` is intentionally trivial to parse from C: each case points to a
 prompt file and each expected token is hex-encoded by bytes. The official JSON
